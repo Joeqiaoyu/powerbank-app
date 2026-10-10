@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import mapboxgl from 'mapbox-gl';
 import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
+import ScannerModal from './ScannerModal';
 import 'mapbox-gl/dist/mapbox-gl.css';
 
 mapboxgl.accessToken = 'pk.eyJ1IjoicWlhb3l1NTE1IiwiYSI6ImNtdXppb3hxcDBzb28yeXNqY3ZsbDM0cnUifQ.pQrYMN00KDIAzLaVrrkTlA';
@@ -17,6 +18,19 @@ export default function MapHome() {
   const [userLocation] = useState([4.101199421590414, 46.009548411992746]); 
   const [cabinets, setCabinets] = useState([]);
   const [mode, setMode] = useState('rent'); 
+  const [showScanner, setShowScanner] = useState(false);
+  const [showInfo, setShowInfo] = useState(false);
+
+  // Le QR peut contenir soit l'ID brut, soit une URL avec ?deviceId=...
+  const handleScanned = (text) => {
+    setShowScanner(false);
+    let deviceId = (text || '').trim();
+    try {
+      const url = new URL(text);
+      deviceId = url.searchParams.get('deviceId') || url.searchParams.get('device') || deviceId;
+    } catch (e) { /* pas une URL : on garde le texte brut */ }
+    if (deviceId) navigate(`/rent?deviceId=${encodeURIComponent(deviceId)}`);
+  };
 
   useEffect(() => {
     if (map.current) return;
@@ -118,15 +132,40 @@ export default function MapHome() {
       {mode === 'rent' && (
         <div style={{ position: 'absolute', bottom: '40px', left: '50%', transform: 'translateX(-50%)', width: '90%', maxWidth: '400px', zIndex: 10 }}>
           <button 
-            onClick={() => {
-              const scannedId = window.prompt("📷 (Simulation de caméra) Entrez le numéro de la machine :");
-              if (scannedId) navigate(`/rent?deviceId=${scannedId}`);
-            }}
+            onClick={() => setShowScanner(true)}
             style={{ width: '100%', backgroundColor: 'black', color: 'white', padding: '16px', borderRadius: '12px', fontWeight: 'bold', fontSize: '18px', cursor: 'pointer', border: 'none', boxShadow: '0 10px 15px -3px rgba(0,0,0,0.2)' }}
           >
             📷 Scanner pour louer
           </button>
         </div>
+      )}
+
+      {/* Bouton info : liens légaux */}
+      <div style={{ position: 'absolute', top: '30px', right: '16px', zIndex: 10 }}>
+        <button
+          onClick={() => setShowInfo(!showInfo)}
+          style={{ width: '40px', height: '40px', borderRadius: '50%', border: 'none', backgroundColor: 'white', boxShadow: '0 4px 6px rgba(0,0,0,0.1)', fontSize: '18px', cursor: 'pointer', fontWeight: 'bold', color: '#4B5563' }}
+          aria-label="Informations légales"
+        >
+          ⓘ
+        </button>
+        {showInfo && (
+          <div style={{ position: 'absolute', top: '48px', right: 0, backgroundColor: 'white', borderRadius: '12px', boxShadow: '0 10px 15px -3px rgba(0,0,0,0.15)', padding: '8px 0', minWidth: '180px' }}>
+            {[
+              ['/mentions-legales', 'Mentions légales'],
+              ['/cgu', 'CGU'],
+              ['/confidentialite', 'Confidentialité'],
+            ].map(([href, label]) => (
+              <a key={href} href={href} style={{ display: 'block', padding: '10px 16px', color: '#1F2937', textDecoration: 'none', fontSize: '14px' }}>
+                {label}
+              </a>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {showScanner && (
+        <ScannerModal onScan={handleScanned} onClose={() => setShowScanner(false)} />
       )}
     </div>
   );
