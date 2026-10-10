@@ -128,6 +128,7 @@ app.get('/api/cabinet/:id', async (req, res) => {
 
     res.json({
       isRentable: data.cabinet.isOnline && actualBatteriesInside > 0,
+      isOnline: !!data.cabinet.isOnline,
       availablePowerBanks: actualBatteriesInside,
       emptyReturnSlots: trueEmptyHoles,
       price: data.priceStrategy.price,
