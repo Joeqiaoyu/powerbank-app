@@ -126,9 +126,12 @@ app.get('/api/cabinet/:id', async (req, res) => {
     const actualBatteriesInside = data.batteries ? data.batteries.length : 0;
     const trueEmptyHoles = totalSlots - actualBatteriesInside;
 
+    // Factory names the field `online`, not `isOnline` — accept both spellings
+    const cabinetOnline = data.cabinet.online ?? data.cabinet.isOnline;
+
     res.json({
-      isRentable: data.cabinet.isOnline && actualBatteriesInside > 0,
-      isOnline: !!data.cabinet.isOnline,
+      isRentable: !!cabinetOnline && actualBatteriesInside > 0,
+      isOnline: !!cabinetOnline,
       availablePowerBanks: actualBatteriesInside,
       emptyReturnSlots: trueEmptyHoles,
       price: data.priceStrategy.price,
