@@ -12,7 +12,12 @@ app.use(cors({
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
+
+// ── Body parsing: support BOTH JSON and x-www-form-urlencoded ──
+// IoT factories (ChargeNow/Bajie) often send form-urlencoded payloads, NOT JSON.
+// Without urlencoded middleware, req.body is undefined for form-encoded webhooks.
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 // ── Environment variable safety checks ──
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
@@ -31,7 +36,11 @@ const stripe = STRIPE_SECRET_KEY ? Stripe(STRIPE_SECRET_KEY) : null;
 
 // ── Factory API (Bajie Charging / ChargeNow) ──────────────────────────
 const FACTORY_BASE_URL = FACTORY_API_BASE_URL || 'https://developer.chargenow.top/cdb-open-api/v1';
-const CALLBACK_URL = process.env.CALLBACK_URL || 'https://powerbank-app-im73.onrender.com/api/rent/callback';
+// ── Factory API callback URL ──
+// This is passed to Factory's /rent/order/create as the callbackURL.
+// The Factory sends async rental results (including return events) to this URL.
+// CRITICAL: Must point to the settlement webhook, not just the callback receiver.
+const CALLBACK_URL = process.env.CALLBACK_URL || 'https://powerbank-app-im73.onrender.com/api/webhook/factory/return';
 
 // Axios instance with Basic Auth
 const factoryApi = axios.create({
@@ -483,13 +492,18 @@ app.post('/api/rent/eject', async (req, res) => {
     }
 
     const tradeNo = response.data.data?.tradeNo;
-    console.log('[FACTORY API] Success! TradeNo:', tradeNo);
+    // ── Extract batteryId from Factory response if available ──
+    // Factory's /rent/order/create may return batteryId/batterySn in response.data.data
+    // This is CRITICAL for reverse lookup in the webhook when Factory doesn't send our tradeNo.
+    const batteryId = response.data.data?.batteryId || response.data.data?.battery_id || response.data.data?.batterySn || response.data.data?.battery_sn || null;
+    console.log('[FACTORY API] Success! TradeNo:', tradeNo, 'BatteryId:', batteryId || 'NOT PROVIDED');
 
     // ── Store rental record for settlement lifecycle ──
     const startTime = new Date();
     rentalRecords.set(tradeNo, {
       tradeNo,
       deviceId,
+      batteryId,                           // ← Store for webhook reverse lookup
       paymentIntentId: paymentIntentId || null,
       startTime: startTime.toISOString(),
       endTime: null,
@@ -497,7 +511,7 @@ app.post('/api/rent/eject', async (req, res) => {
       billing: null,            // populated on return/settlement
       createdAt: startTime.toISOString(),
     });
-    console.log(`[RENTAL RECORD] Created for tradeNo=${tradeNo}, deviceId=${deviceId}, startTime=${startTime.toISOString()}, paymentIntentId=${paymentIntentId || 'NONE'}`);
+    console.log(`[RENTAL RECORD] Created for tradeNo=${tradeNo}, deviceId=${deviceId}, batteryId=${batteryId || 'N/A'}, startTime=${startTime.toISOString()}, paymentIntentId=${paymentIntentId || 'NONE'}`);
 
     res.json({
       success: true,
@@ -606,72 +620,81 @@ app.get('/api/rent/detail', async (req, res) => {
 });
 
 // ── 7. POST /api/rent/callback — Async callback receiver (Factory pushes rental results)
-app.post('/api/rent/callback', (req, res) => {
-  const { tradeNo, ...rest } = req.body;
+// Factory API sends async events here (rental created, battery ejected, battery returned, etc.)
+// This endpoint stores the callback data AND checks if the battery was returned.
+// If a return is detected, it triggers settlement inline (since CALLBACK_URL may point here).
+app.post('/api/rent/callback', async (req, res) => {
+  // ── Deep logging: catch everything the Factory sends ──
+  console.log('[FACTORY CALLBACK] Headers:', JSON.stringify(req.headers, null, 2));
+  console.log('[FACTORY CALLBACK] Body (raw):', JSON.stringify(req.body, null, 2));
+  console.log('[FACTORY CALLBACK] Content-Type:', req.headers['content-type']);
+
+  // ── Store callback data for debugging/polling ──
+  const body = req.body || {};
+  // Try every possible field name for the order identifier
+  const tradeNo = body.tradeNo || body.order_id || body.orderId || body.orderId || body.sn || body.orderNo;
+  const batteryId = body.batteryId || body.battery_id || body.batterySn || body.battery_sn;
+  const deviceId = body.deviceId || body.device_id || body.cabinetId || body.cabinet_id;
+  const factoryStatus = body.status || body.type || body.event || body.action;
+
   if (tradeNo) {
-    rentalResults.set(tradeNo, { ...rest, timestamp: Date.now() });
+    rentalResults.set(tradeNo, { ...body, timestamp: Date.now() });
+    console.log(`[FACTORY CALLBACK] Stored callback for tradeNo=${tradeNo}, status=${factoryStatus}, batteryId=${batteryId || 'N/A'}, deviceId=${deviceId || 'N/A'}`);
+  } else {
+    console.warn('[FACTORY CALLBACK] No tradeNo/order_id found in callback. Available fields:', Object.keys(body));
   }
+
+  // ── Check if this callback indicates a battery return ──
+  // Factory may send status='returned', type='return', event='battery_return', etc.
+  const returnKeywords = ['return', 'returned', 'end', 'ended', 'finish', 'finished', 'complete', 'completed'];
+  const isReturnEvent = factoryStatus && returnKeywords.some(kw =>
+    String(factoryStatus).toLowerCase().includes(kw)
+  );
+
+  if (isReturnEvent && tradeNo) {
+    console.log(`[FACTORY CALLBACK] *** RETURN EVENT detected for tradeNo=${tradeNo}. Triggering settlement... ***`);
+
+    // ── Trigger settlement inline ──
+    const record = rentalRecords.get(tradeNo);
+    if (record && record.status === 'active') {
+      try {
+        await settleRental(tradeNo, record, body.returnDeviceId || body.return_device_id || deviceId, batteryId);
+        console.log(`[FACTORY CALLBACK] Settlement completed for tradeNo=${tradeNo}`);
+      } catch (err) {
+        console.error(`[FACTORY CALLBACK] Settlement FAILED for tradeNo=${tradeNo}:`, err.message);
+      }
+    } else if (record && record.status === 'completed') {
+      console.log(`[FACTORY CALLBACK] tradeNo=${tradeNo} already completed, ignoring.`);
+    } else {
+      console.warn(`[FACTORY CALLBACK] No active rental record for tradeNo=${tradeNo}. Cannot settle.`);
+    }
+  }
+
+  // Always respond success so Factory doesn't retry
   res.json({ code: 0, msg: 'success' });
 });
 
-// ── 7b. POST /api/webhook/factory/return — Settlement Webhook (battery returned, cross-station capable)
-// Factory API calls this when a battery is returned to ANY cabinet.
-// The return device may be DIFFERENT from the dispensing device (cross-station return).
-// We use tradeNo to locate the original rental record + Stripe pre-auth, regardless of return station.
-app.post('/api/webhook/factory/return', async (req, res) => {
-  const {
-    tradeNo,                                    // Original order ID (links to rental record)
-    deviceId: dispensingDeviceId,               // Device that dispensed the battery (may be absent in return event)
-    returnDeviceId,                             // Device that received the battery (may differ from dispensing)
-    batteryId,                                  // Physical battery ID
-    status: factoryStatus,                      // Factory status string
-  } = req.body;
+// ── Settlement Helper: Calculate duration, update status, then capture Stripe ──
+// Extracted as a standalone function so both the webhook and callback endpoint can call it.
+// CRITICAL: Status is set to 'completed' BEFORE Stripe capture. Even if Stripe fails,
+// the timer must stop and the user must see the receipt.
+async function settleRental(orderId, record, returnDeviceId, batteryId) {
   const now = new Date();
-
-  console.log('[WEBHOOK RETURN] Received factory return event:', JSON.stringify(req.body, null, 2));
-  console.log(`[WEBHOOK RETURN] tradeNo=${tradeNo}, dispensingDevice=${dispensingDeviceId || 'N/A'}, returnDevice=${returnDeviceId || 'N/A'}, batteryId=${batteryId || 'N/A'}`);
-
-  // ── Support multiple field name variants Factory may use ──
-  // Some Factory payloads use "order_id" or "orderId" instead of "tradeNo"
-  const orderId = tradeNo || req.body.order_id || req.body.orderId;
-
-  if (!orderId) {
-    console.error('[WEBHOOK RETURN] Missing tradeNo/order_id in webhook payload');
-    return res.status(400).json({ code: -1, msg: 'Missing tradeNo' });
-  }
-
-  // ── Find the rental record by order ID (works regardless of which station received the battery) ──
-  const record = rentalRecords.get(orderId);
-  if (!record) {
-    console.warn(`[WEBHOOK RETURN] No rental record found for orderId=${orderId}. Cross-station return from device ${returnDeviceId || 'unknown'} — record may have been created by another instance.`);
-    // Still respond success so Factory doesn't retry
-    return res.json({ code: 0, msg: 'success' });
-  }
-
-  if (record.status === 'completed') {
-    console.log(`[WEBHOOK RETURN] orderId=${orderId} already completed, ignoring duplicate webhook.`);
-    return res.json({ code: 0, msg: 'success' });
-  }
-
-  // ── Log cross-station detection ──
-  if (returnDeviceId && returnDeviceId !== record.deviceId) {
-    console.log(`[WEBHOOK RETURN] *** CROSS-STATION RETURN detected! Battery dispensed by ${record.deviceId}, returned to ${returnDeviceId}. Settlement proceeds normally. ***`);
-  }
-
-  // ── Step 1: Calculate rental duration ──
   const startTime = new Date(record.startTime);
   const endTime = now;
   const durationMs = endTime - startTime;
   const durationMinutes = Math.floor(durationMs / 60000);
   const durationHours = Math.floor(durationMinutes / 60);
   const remainingMinutes = durationMinutes % 60;
+  const durationSeconds = Math.floor(durationMs / 1000);
 
   console.log(`[SETTLEMENT] orderId=${orderId}`);
   console.log(`[SETTLEMENT] Dispensing device: ${record.deviceId} | Return device: ${returnDeviceId || record.deviceId}`);
+  console.log(`[SETTLEMENT] Battery ID: ${batteryId || 'N/A'}`);
   console.log(`[SETTLEMENT] Start: ${startTime.toISOString()} | End: ${endTime.toISOString()}`);
   console.log(`[SETTLEMENT] Duration: ${durationMs}ms = ${durationMinutes} min (${durationHours}h ${remainingMinutes}m)`);
 
-  // ── Step 2: Apply pricing model ──
+  // ── Step 1: Apply pricing model ──
   const PRICE_PER_HOUR = 1;
   const FREE_MINUTES = 10;
   const MIN_CHARGE = 1;
@@ -698,43 +721,11 @@ app.post('/api/webhook/factory/return', async (req, res) => {
   console.log(`[SETTLEMENT] Deposit held: ${DEPOSIT_AMOUNT / 100} EUR (${DEPOSIT_AMOUNT} cents)`);
   console.log(`[SETTLEMENT] To be released: ${releasedAmountCents / 100} EUR (${releasedAmountCents} cents)`);
 
-  // ── Step 3: Stripe capture (uses the ORIGINAL paymentIntentId from the rental record) ──
-  let stripeCaptureResult = null;
-  if (record.paymentIntentId && stripe) {
-    try {
-      console.log(`[SETTLEMENT] Capturing ${chargeAmountCents} cents from PI=${record.paymentIntentId}`);
-
-      if (chargeAmountCents > 0) {
-        const capture = await stripe.paymentIntents.capture(record.paymentIntentId, {
-          amount_to_capture: chargeAmountCents,
-        });
-        stripeCaptureResult = {
-          status: capture.status,
-          amountReceived: capture.amount_received,
-          id: capture.id,
-        };
-        console.log(`[SETTLEMENT] Stripe capture SUCCESS: status=${capture.status}, amount_received=${capture.amount_received}, id=${capture.id}`);
-      } else {
-        const cancel = await stripe.paymentIntents.cancel(record.paymentIntentId);
-        stripeCaptureResult = {
-          status: cancel.status,
-          amountReceived: 0,
-          id: cancel.id,
-        };
-        console.log(`[SETTLEMENT] Stripe cancel SUCCESS (free rental): status=${cancel.status}, id=${cancel.id}`);
-      }
-    } catch (stripeError) {
-      console.error(`[SETTLEMENT] Stripe capture FAILED:`, stripeError.message);
-      console.error(`[SETTLEMENT] Stripe error type:`, stripeError.type, 'code:', stripeError.code);
-      stripeCaptureResult = { error: stripeError.message, code: stripeError.code };
-    }
-  } else {
-    console.warn(`[SETTLEMENT] No paymentIntentId or Stripe not configured — skipping capture.`);
-  }
-
-  // ── Step 4: Update rental record ──
+  // ── Step 2: CRITICAL — Update rental record to 'completed' BEFORE Stripe capture ──
+  // Even if Stripe fails, the frontend timer must stop and the user must see the receipt.
   const billing = {
     durationMinutes,
+    durationSeconds,
     durationDisplay: `${durationHours} h ${remainingMinutes} min`,
     freeMinutes: FREE_MINUTES,
     pricePerHour: PRICE_PER_HOUR,
@@ -743,10 +734,10 @@ app.post('/api/webhook/factory/return', async (req, res) => {
     depositAmountEur: DEPOSIT_AMOUNT / 100,
     releasedAmountEur: releasedAmountCents / 100,
     currency: 'EUR',
-    stripeCapture: stripeCaptureResult,
     crossStationReturn: returnDeviceId ? (returnDeviceId !== record.deviceId) : false,
     dispensingDeviceId: record.deviceId,
     returnDeviceId: returnDeviceId || record.deviceId,
+    stripeCapture: null, // populated after Stripe capture below
   };
 
   record.endTime = endTime.toISOString();
@@ -755,7 +746,169 @@ app.post('/api/webhook/factory/return', async (req, res) => {
   record.returnDeviceId = returnDeviceId || null;
   rentalRecords.set(orderId, record);
 
-  console.log(`[SETTLEMENT] Record updated: orderId=${orderId}, status=completed, billing=${JSON.stringify(billing)}`);
+  console.log(`[WEBHOOK SUCCESS] Order updated to completed. Final Cost: ${chargeAmountEur} EUR`);
+  console.log(`[SETTLEMENT] Record saved: orderId=${orderId}, status=completed`);
+
+  // ── Step 3: Stripe capture (AFTER status is saved) ──
+  // If this fails, the order is still marked completed — timer stops, user sees receipt.
+  // The Stripe hold remains and must be manually captured or released.
+  if (record.paymentIntentId && stripe) {
+    try {
+      console.log(`[SETTLEMENT] Capturing ${chargeAmountCents} cents from PI=${record.paymentIntentId}`);
+
+      if (chargeAmountCents > 0) {
+        const capture = await stripe.paymentIntents.capture(record.paymentIntentId, {
+          amount_to_capture: chargeAmountCents,
+        });
+        billing.stripeCapture = {
+          status: capture.status,
+          amountReceived: capture.amount_received,
+          id: capture.id,
+        };
+        console.log(`[SETTLEMENT] Stripe capture SUCCESS: status=${capture.status}, amount_received=${capture.amount_received}, id=${capture.id}`);
+      } else {
+        const cancel = await stripe.paymentIntents.cancel(record.paymentIntentId);
+        billing.stripeCapture = {
+          status: cancel.status,
+          amountReceived: 0,
+          id: cancel.id,
+        };
+        console.log(`[SETTLEMENT] Stripe cancel SUCCESS (free rental): status=${cancel.status}, id=${cancel.id}`);
+      }
+
+      // Update the record with Stripe capture result
+      record.billing = billing;
+      rentalRecords.set(orderId, record);
+    } catch (stripeError) {
+      console.error(`[SETTLEMENT] Stripe capture FAILED:`, stripeError.message);
+      console.error(`[SETTLEMENT] Stripe error type:`, stripeError.type, 'code:', stripeError.code);
+      billing.stripeCapture = { error: stripeError.message, code: stripeError.code };
+      record.billing = billing;
+      rentalRecords.set(orderId, record);
+      // DO NOT throw — the order is already marked completed. Timer stops, user sees receipt.
+    }
+  } else {
+    console.warn(`[SETTLEMENT] No paymentIntentId or Stripe not configured — skipping capture. Order is still marked completed.`);
+  }
+
+  console.log(`[SETTLEMENT] COMPLETE for orderId=${orderId}, charge=${chargeAmountEur} EUR`);
+  return billing;
+}
+
+// ── 7b. POST /api/webhook/factory/return — Settlement Webhook (battery returned, cross-station capable)
+// Factory API calls this when a battery is returned to ANY cabinet.
+// This endpoint handles ALL possible Factory payload formats (JSON, form-urlencoded, etc.)
+// and ALL possible field names (tradeNo, order_id, battery_id, device_id, sn, etc.)
+app.post('/api/webhook/factory/return', async (req, res) => {
+  // ── DEEP CATCH-ALL LOGGING at the very top ──
+  // IoT factories often send x-www-form-urlencoded instead of JSON.
+  // We log everything to diagnose format mismatches.
+  console.log('═══════════════════════════════════════════════════════════════');
+  console.log('[WEBHOOK RECEIVED] Headers:', JSON.stringify(req.headers, null, 2));
+  console.log('[WEBHOOK RECEIVED] Body (raw):', JSON.stringify(req.body, null, 2));
+  console.log('[WEBHOOK RECEIVED] Content-Type:', req.headers['content-type']);
+  console.log('[WEBHOOK RECEIVED] Body type:', typeof req.body);
+  console.log('[WEBHOOK RECEIVED] Body keys:', req.body ? Object.keys(req.body) : 'NO BODY');
+  console.log('═══════════════════════════════════════════════════════════════');
+
+  const body = req.body || {};
+  const now = new Date();
+
+  // ── Extract ALL possible identifier fields from the Factory payload ──
+  // Different Factory API versions and event types use different field names.
+  const tradeNo      = body.tradeNo || body.trade_no || body.tradeNo;
+  const orderId      = tradeNo || body.order_id || body.orderId || body.orderNo || body.order_no || body.sn;
+  const batteryId    = body.batteryId || body.battery_id || body.batterySn || body.battery_sn || body.powerBankId || body.power_bank_id;
+  const deviceId     = body.deviceId || body.device_id || body.cabinetId || body.cabinet_id || body.machineId || body.machine_id;
+  const returnDeviceId = body.returnDeviceId || body.return_device_id || body.returnCabinetId || body.return_cabinet_id || deviceId;
+  const factoryStatus = body.status || body.type || body.event || body.action || body.eventType;
+
+  console.log(`[WEBHOOK RETURN] Parsed identifiers:`);
+  console.log(`  orderId/tradeNo:  ${orderId || 'NOT FOUND'}`);
+  console.log(`  batteryId:        ${batteryId || 'NOT FOUND'}`);
+  console.log(`  deviceId:         ${deviceId || 'NOT FOUND'}`);
+  console.log(`  returnDeviceId:   ${returnDeviceId || 'NOT FOUND'}`);
+  console.log(`  factoryStatus:    ${factoryStatus || 'NOT FOUND'}`);
+
+  // ── Step 1: Find the rental record ──
+  // Try by orderId/tradeNo first
+  let record = null;
+  let resolvedOrderId = null;
+
+  if (orderId) {
+    record = rentalRecords.get(orderId);
+    resolvedOrderId = orderId;
+  }
+
+  // ── If no record found by orderId, try reverse lookup by batteryId ──
+  // The Factory may send only a battery_id without our tradeNo
+  if (!record && batteryId) {
+    console.log(`[WEBHOOK RETURN] No record found by orderId. Trying reverse lookup by batteryId=${batteryId}...`);
+    for (const [tn, rec] of rentalRecords.entries()) {
+      if (rec.status === 'active') {
+        console.log(`[WEBHOOK RETURN] Checking active record: tradeNo=${tn}, batteryId=${rec.batteryId || 'N/A'}, deviceId=${rec.deviceId}`);
+        if (rec.batteryId === batteryId) {
+          record = rec;
+          resolvedOrderId = tn;
+          console.log(`[WEBHOOK RETURN] *** MATCH FOUND by batteryId! tradeNo=${tn} ***`);
+          break;
+        }
+      }
+    }
+  }
+
+  // ── If still no record, try reverse lookup by deviceId (for active rentals on that device) ──
+  if (!record && deviceId) {
+    console.log(`[WEBHOOK RETURN] No record found by batteryId. Trying reverse lookup by deviceId=${deviceId}...`);
+    for (const [tn, rec] of rentalRecords.entries()) {
+      if (rec.status === 'active' && rec.deviceId === deviceId) {
+        record = rec;
+        resolvedOrderId = tn;
+        console.log(`[WEBHOOK RETURN] *** MATCH FOUND by deviceId! tradeNo=${tn} (most recent active rental on this device) ***`);
+        break;
+      }
+    }
+  }
+
+  // ── If no record found at all, respond success (Factory won't retry) ──
+  if (!record) {
+    console.warn(`[WEBHOOK RETURN] No rental record found. Tried orderId=${orderId}, batteryId=${batteryId}, deviceId=${deviceId}. Responding success to prevent Factory retries.`);
+    // Log all active rental records for debugging
+    const activeRecords = [];
+    for (const [tn, rec] of rentalRecords.entries()) {
+      if (rec.status === 'active') activeRecords.push({ tradeNo: tn, deviceId: rec.deviceId, batteryId: rec.batteryId });
+    }
+    console.log(`[WEBHOOK RETURN] Active rental records in memory: ${activeRecords.length}`, JSON.stringify(activeRecords, null, 2));
+    return res.json({ code: 0, msg: 'success' });
+  }
+
+  // ── If already completed, ignore duplicate ──
+  if (record.status === 'completed') {
+    console.log(`[WEBHOOK RETURN] orderId=${resolvedOrderId} already completed, ignoring duplicate webhook.`);
+    return res.json({ code: 0, msg: 'success' });
+  }
+
+  // ── Log cross-station detection ──
+  if (returnDeviceId && returnDeviceId !== record.deviceId) {
+    console.log(`[WEBHOOK RETURN] *** CROSS-STATION RETURN detected! Battery dispensed by ${record.deviceId}, returned to ${returnDeviceId}. Settlement proceeds normally. ***`);
+  }
+
+  // ── Step 2: Run settlement (status='completed' is set BEFORE Stripe capture) ──
+  try {
+    await settleRental(resolvedOrderId, record, returnDeviceId, batteryId);
+    console.log(`[WEBHOOK SUCCESS] Order updated to completed. Final Cost: ${record.billing?.chargeAmountEur || 0} EUR`);
+  } catch (err) {
+    console.error(`[WEBHOOK RETURN] Settlement threw error:`, err.message);
+    // Even if settlement threw, the record may have been partially updated.
+    // Force the status to completed so the timer stops.
+    record.status = 'completed';
+    record.endTime = now.toISOString();
+    if (!record.billing) {
+      record.billing = { error: err.message, chargeAmountEur: 0, releasedAmountEur: 30 };
+    }
+    rentalRecords.set(resolvedOrderId, record);
+    console.log(`[WEBHOOK RETURN] FORCED status=completed due to settlement error. Timer will stop.`);
+  }
 
   res.json({ code: 0, msg: 'success' });
 });
@@ -781,12 +934,29 @@ app.get('/api/rent/status/:orderId', async (req, res) => {
         });
         console.log(`[STATUS POLL] Factory query response:`, JSON.stringify(factoryRes.data, null, 2));
 
-        // Check if Factory indicates the battery was returned
+        // ── Check if Factory indicates the battery was returned ──
+        // Factory's order/query may return status, returnTime, endTime, or similar fields
+        const factoryData = factoryRes.data?.data;
         const callbackData = rentalResults.get(orderId);
+
         if (callbackData) {
           console.log(`[STATUS POLL] Found callback data:`, JSON.stringify(callbackData));
-          if (callbackData.status === 'returned' || callbackData.returnTime) {
-            console.log(`[STATUS POLL] Battery returned detected via callback. Settlement should be handled by webhook.`);
+        }
+
+        // ── SAFETY FALLBACK: If Factory says battery returned but webhook hasn't fired yet,
+        // trigger settlement inline so the frontend timer stops. ──
+        if (factoryData) {
+          const factoryOrderStatus = String(factoryData.status || factoryData.orderStatus || factoryData.state || '').toLowerCase();
+          const hasReturnTime = factoryData.returnTime || factoryData.endTime || factoryData.return_time || factoryData.end_time;
+          const returnKeywords = ['return', 'returned', 'end', 'ended', 'finish', 'finished', 'complete', 'completed', 'close', 'closed'];
+          const factorySaysReturned = returnKeywords.some(kw => factoryOrderStatus.includes(kw)) || hasReturnTime;
+
+          if (factorySaysReturned) {
+            console.log(`[STATUS POLL] *** FACTORY indicates battery RETURNED for tradeNo=${orderId}. Triggering inline settlement as safety fallback... ***`);
+            const returnDeviceId = factoryData.returnDeviceId || factoryData.return_device_id || factoryData.cabinetId || factoryData.device_id || record.deviceId;
+            const batteryId = factoryData.batteryId || factoryData.battery_id || factoryData.batterySn || record.batteryId || null;
+            await settleRental(orderId, record, returnDeviceId, batteryId);
+            console.log(`[STATUS POLL] Inline settlement completed. Record is now completed.`);
           }
         }
       } catch (err) {

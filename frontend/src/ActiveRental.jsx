@@ -45,6 +45,17 @@ export default function ActiveRental() {
     try {
       const { data } = await api.get(`/api/rent/status/${orderId}`);
 
+      // ── Log initial status fetch for debugging ──
+      console.log("[INITIAL STATUS FETCH]", {
+        status: data.status,
+        orderId: data.orderId,
+        startTime: data.startTime,
+        totalDuration: data.totalDuration,
+        finalCost: data.finalCost,
+        hasBilling: !!data.billing,
+        raw: data,
+      });
+
       if (data.status === 'completed') {
         // Battery already returned — go straight to summary
         setRentalStatus('completed');
@@ -106,21 +117,53 @@ export default function ActiveRental() {
       try {
         const { data } = await api.get(`/api/rent/status/${orderId}`);
 
+        // ── POLLING FAILSAFE: log every response for debugging ──
+        console.log("[POLL RESPONSE]", {
+          status: data.status,
+          orderId: data.orderId,
+          totalDuration: data.totalDuration,
+          finalCost: data.finalCost,
+          billing: data.billing,
+          raw: data,
+        });
+
         if (data.status === 'completed') {
+          // ── CRITICAL: Clear BOTH intervals IMMEDIATELY ──
+          // The tick clock and the polling interval must stop the instant
+          // we detect completion. Any delay causes the timer to keep ticking.
           clearInterval(pollRef.current);
           pollRef.current = null;
-          clearInterval(tickRef.current);
-          tickRef.current = null;
+          if (tickRef.current) {
+            clearInterval(tickRef.current);
+            tickRef.current = null;
+          }
+
           setFinalCost(data.finalCost);
           setRentalStatus('completed');
 
-          // Auto-redirect to summary after 1.2s
+          // Auto-redirect to summary after brief delay so user sees the "returned" flash
           setTimeout(() => {
             navigate(`/rent/summary?orderId=${orderId}`);
           }, 1200);
+          return; // Stop further polling
+        }
+
+        // ── If backend returned a different startTime, sync it ──
+        if (data.startTime && data.startTime !== startTimeMs?.toString()) {
+          const ms = new Date(data.startTime).getTime();
+          if (!isNaN(ms)) {
+            setStartTimeMs(ms);
+            const elapsed = Math.floor((Date.now() - ms) / 1000);
+            setElapsedSeconds(elapsed > 0 ? elapsed : 0);
+          }
         }
       } catch (err) {
         console.warn('[POLL] Status query error:', err.message);
+        console.warn('[POLL] Error details:', {
+          code: err.code,
+          status: err.response?.status,
+          data: err.response?.data,
+        });
       }
     }, 5000);
 
