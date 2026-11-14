@@ -84,7 +84,7 @@ app.get('/health', (req, res) => {
   });
 });
 
-// ── 1. GET /api/nearby — List Nearby Rentable Shops (Factory: POST /rent/cabinet/list)
+// ── 1. GET /api/nearby — List Nearby Rentable Shops (Factory: GET /rent/cabinet/query)
 app.get('/api/nearby', async (req, res) => {
   try {
     const lat = parseFloat(req.query.lat) || 46.0363;
@@ -95,12 +95,46 @@ app.get('/api/nearby', async (req, res) => {
       params: { deviceId: 'DTA55642' },
     });
 
+    // ── Deep logging: raw Factory response ──
+    console.log('[FACTORY NEARBY RAW DATA]:', JSON.stringify(factoryRes.data, null, 2));
+
     if (factoryRes.data.code !== 0) {
-      return res.json(MOCK_NEARBY);
+      // Factory returned non-zero code — device may be offline
+      // Code 2004 = device not found, 2005 = device offline
+      console.warn('[FACTORY NEARBY] Non-zero code:', factoryRes.data.code, 'Msg:', factoryRes.data.msg);
+      // Return data with explicit online=false so frontend shows correct status
+      return res.json([
+        {
+          id: 'DTA55642',
+          shopName: ' Joe Shop',
+          lat: 46.0095004,
+          lng: 4.100983,
+          emptySlots: 0,
+          rentableBatteries: 0,
+          freeNum: 0,
+          distance: '0.0 km',
+          price: '1',
+          deposit: '30',
+          currency: 'EUR',
+          isOnline: false,
+          message: factoryRes.data.msg || 'Device offline',
+        }
+      ]);
     }
 
     const data = factoryRes.data.data;
     if (!data) throw new Error("No data from factory");
+
+    // ── Extract online status from Factory's cabinet object ──
+    // Factory returns: data.cabinet.online (boolean true/false)
+    // Some API versions may use: data.cabinet.isOnline (boolean) or data.cabinet.online (number: 1/0)
+    const factoryIsOnline = data.cabinet.online === true || data.cabinet.isOnline === true || data.cabinet.online === 1 || data.cabinet.online === '1';
+    console.log('[FACTORY NEARBY] Cabinet online status:', {
+      'cabinet.online': data.cabinet.online,
+      'cabinet.isOnline': data.cabinet.isOnline,
+      'cabinet.posOnlineStatus': data.cabinet.posOnlineStatus,
+      'resolved': factoryIsOnline,
+    });
 
     const realLat = parseFloat(data.shop.latitude) || 46.009548411992746;
     const realLng = parseFloat(data.shop.longitude) || 4.101199421590414;
@@ -115,54 +149,108 @@ app.get('/api/nearby', async (req, res) => {
     res.json([
       {
         id: 'DTA55642',
+        shopName: data.shop?.name || ' Joe Shop',
         lat: realLat,
         lng: realLng,
         emptySlots: trueEmptyHoles,
-        rentableBatteries: actualBatteriesInside
+        rentableBatteries: actualBatteriesInside,
+        freeNum: trueEmptyHoles,
+        distance: '0.0 km',
+        price: String(data.priceStrategy?.price || '1'),
+        deposit: String(data.priceStrategy?.depositAmount || '30'),
+        currency: data.priceStrategy?.currency || 'EUR',
+        isOnline: factoryIsOnline,
       }
     ]);
   } catch (error) {
+    console.error('[FACTORY NEARBY FETCH FAILED]:', error.message);
+    if (error.response) {
+      console.error('[FACTORY NEARBY ERROR] Status:', error.response.status, 'Data:', JSON.stringify(error.response.data));
+    }
+    // Return mock data with explicit offline status on total failure
     res.json(MOCK_NEARBY);
   }
 });
 
 // ── 2. GET /api/cabinet/:id — Get Rentable Device and Pricing (Factory: GET /rent/cabinet/query)
 app.get('/api/cabinet/:id', async (req, res) => {
+  const deviceId = req.params.id;
   try {
     const response = await factoryApi.get('/rent/cabinet/query', {
-      params: { deviceId: req.params.id },
+      params: { deviceId },
     });
 
+    // ── Deep logging: raw Factory response ──
+    console.log('[FACTORY STATUS RAW DATA]:', JSON.stringify(response.data, null, 2));
+
     if (response.data.code !== 0) {
-      // Device offline or not found — return fallback with correct online status
-      const isOffline = response.data.code === 2004;
+      // Factory returned non-zero code
+      // Known error codes: 2004 = device not found, 2005 = device offline
+      const errorCode = response.data.code;
+      const errorMsg = response.data.msg || 'Unknown error';
+      const isOffline = errorCode === 2004 || errorCode === 2005;
+
+      console.warn(`[FACTORY STATUS] Device ${deviceId} non-zero code: ${errorCode} (${errorMsg}) — isOffline: ${isOffline}`);
+
       return res.json({
         ...MOCK_CABINET,
-        cabinetId: req.params.id,
+        cabinetId: deviceId,
         isOnline: !isOffline,
         isRentable: !isOffline,
         availablePowerBanks: isOffline ? 0 : MOCK_CABINET.availablePowerBanks,
-        message: response.data.msg || '',
+        message: errorMsg,
+        factoryCode: errorCode,
       });
     }
 
     const data = response.data.data;
     if (!data) throw new Error("No data from factory");
 
+    // ── Extract online status from Factory's cabinet object ──
+    // Factory returns: data.cabinet.online (boolean true/false)
+    // Some API versions may use: data.cabinet.isOnline (boolean) or data.cabinet.online (number: 1/0)
+    const factoryIsOnline = data.cabinet.online === true || data.cabinet.isOnline === true || data.cabinet.online === 1 || data.cabinet.online === '1';
+    console.log('[FACTORY STATUS] Cabinet online field:', {
+      'cabinet.online': data.cabinet.online,
+      'cabinet.isOnline': data.cabinet.isOnline,
+      'cabinet.posOnlineStatus': data.cabinet.posOnlineStatus,
+      'resolved': factoryIsOnline,
+    });
+
     const totalSlots = data.cabinet.slots;
     const actualBatteriesInside = data.batteries ? data.batteries.length : 0;
     const trueEmptyHoles = totalSlots - actualBatteriesInside;
+    const isRentable = factoryIsOnline && actualBatteriesInside > 0;
+
+    console.log(`[FACTORY STATUS] Device ${deviceId}: online=${factoryIsOnline}, batteries=${actualBatteriesInside}, emptySlots=${trueEmptyHoles}, rentable=${isRentable}`);
 
     res.json({
-      isRentable: data.cabinet.isOnline && actualBatteriesInside > 0,
+      isRentable,
+      isOnline: factoryIsOnline,
       availablePowerBanks: actualBatteriesInside,
       emptyReturnSlots: trueEmptyHoles,
-      price: data.priceStrategy.price,
-      currency: data.priceStrategy.currency,
-      deposit: data.priceStrategy.depositAmount
+      price: data.priceStrategy?.price ?? 1,
+      currency: data.priceStrategy?.currency ?? 'EUR',
+      deposit: data.priceStrategy?.depositAmount ?? 30,
+      cabinetId: deviceId,
+      shopName: data.shop?.name || ' Joe Shop',
+      freeMinutes: data.priceStrategy?.freeMinutes ?? 10,
+      dailyMaxPrice: data.priceStrategy?.dailyMaxPrice ?? 10,
+      currencySymbol: data.priceStrategy?.currency === 'EUR' ? '€' : (data.priceStrategy?.currencySymbol || '€'),
     });
   } catch (error) {
-    res.json({ ...MOCK_CABINET, cabinetId: req.params.id });
+    console.error('[FACTORY STATUS FETCH FAILED]:', error.message);
+    if (error.response) {
+      console.error('[FACTORY STATUS ERROR] Status:', error.response.status, 'Data:', JSON.stringify(error.response.data));
+    }
+    // Fallback — mark as offline since we can't confirm status
+    res.json({
+      ...MOCK_CABINET,
+      cabinetId: deviceId,
+      isOnline: false,
+      isRentable: false,
+      message: 'Unable to reach factory server',
+    });
   }
 });
 

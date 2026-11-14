@@ -192,8 +192,13 @@ export default function RentCheckout() {
               <span className="text-xs"> · Plafond: {sym}{cabinet.dailyMaxPrice}/jour</span>
             )}
           </p>
-          {!cabinet.isOnline && (
-            <p className="text-sm text-red-500 mt-1">⚠️ Hors ligne</p>
+          {cabinet.isOnline === false && (
+            <p className="text-sm text-orange-500 mt-2">
+              ⚠️ Le serveur signale la station hors ligne. Vous pouvez tout de même tenter la location.
+            </p>
+          )}
+          {cabinet.availablePowerBanks === 0 && cabinet.isOnline !== false && (
+            <p className="text-sm text-red-500 mt-2">⚠️ Aucune batterie disponible</p>
           )}
         </div>
 
@@ -203,7 +208,7 @@ export default function RentCheckout() {
           </div>
           <button
             type="submit"
-            disabled={!stripe || loading || !cabinet.isRentable}
+            disabled={!stripe || loading}
             className="w-full bg-green-500 text-white py-4 rounded-xl font-bold text-lg disabled:opacity-50"
           >
             {loading ? 'Traitement...' : `Autoriser ${sym}${cabinet.deposit} et Louer`}
