@@ -63,10 +63,34 @@ async function queryDevice(deviceId) {
     params: { deviceId },
   });
 
+  // ── Log raw Factory response for debugging ──
+  console.log(`[QUERY DEVICE] ${deviceId} raw response code=${response.data.code}, msg="${response.data.msg}"`);
+  if (response.data.data) {
+    console.log(`[QUERY DEVICE] ${deviceId} has data: shop=${!!response.data.data.shop}, cabinet=${!!response.data.data.cabinet}, batteries=${response.data.data.batteries?.length || 0}`);
+  }
+
+  // ── Even when code !== 0 (offline/not found), Factory may still return location data in response.data.data ──
+  // We extract whatever we can so the map can still show the device with an offline indicator.
+  const rawData = response.data.data;
+  const extractLocation = () => {
+    if (!rawData) return {};
+    return {
+      shopName: rawData.shop?.name || undefined,
+      shopAddress: rawData.shop?.address || undefined,
+      lat: parseFloat(rawData.shop?.latitude) || undefined,
+      lng: parseFloat(rawData.shop?.longitude) || undefined,
+      totalSlots: rawData.cabinet?.slots || undefined,
+    };
+  };
+
   if (response.data.code !== 0) {
     // Device offline or not found
     const errorCode = response.data.code;
     const isOffline = errorCode === 2004 || errorCode === 2005;
+    const loc = extractLocation();
+
+    console.log(`[QUERY DEVICE] ${deviceId} OFFLINE (code=${errorCode}). Location data available: lat=${loc.lat || 'none'}, lng=${loc.lng || 'none'}`);
+
     return {
       id: deviceId,
       isOnline: !isOffline,
@@ -75,10 +99,19 @@ async function queryDevice(deviceId) {
       rentableBatteries: 0,
       emptySlots: 0,
       freeNum: 0,
+      totalSlots: loc.totalSlots || 0,
+      shopName: loc.shopName || 'Power Bank Station',
+      shopAddress: loc.shopAddress || '',
+      // ── CRITICAL: return lat/lng even for offline devices so they show on the map ──
+      // If Factory didn't include location, fall back to 0 (frontend will filter out invalid coords)
+      lat: loc.lat || 0,
+      lng: loc.lng || 0,
       price: '1',
       deposit: '30',
       currency: 'EUR',
       currencySymbol: '\u20ac',
+      freeMinutes: 10,
+      dailyMaxPrice: 10,
       message: response.data.msg || 'Device offline',
       factoryCode: errorCode,
     };
@@ -108,7 +141,7 @@ async function queryDevice(deviceId) {
     price: String(data.priceStrategy?.price ?? '1'),
     deposit: String(data.priceStrategy?.depositAmount ?? '30'),
     currency: data.priceStrategy?.currency ?? 'EUR',
-    currencySymbol: data.priceStrategy?.currencySymbol || (data.priceStrategy?.currency === 'EUR' ? '\u20ac' : '\u20ac'),
+    currencySymbol: data.priceStrategy?.currencySymbol || '\u20ac',
     freeMinutes: data.priceStrategy?.freeMinutes ?? 10,
     dailyMaxPrice: data.priceStrategy?.dailyMaxPrice ?? 10,
   };
@@ -153,9 +186,15 @@ app.get('/api/nearby', async (req, res) => {
       emptyReturnSlots: 0,
       emptySlots: 0,
       freeNum: 0,
+      totalSlots: 0,
+      lat: 0,
+      lng: 0,
       price: '1',
       deposit: '30',
       currency: 'EUR',
+      currencySymbol: '\u20ac',
+      freeMinutes: 10,
+      dailyMaxPrice: 10,
       message: 'Unable to reach device',
     };
   });
