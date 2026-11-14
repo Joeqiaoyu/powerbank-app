@@ -100,14 +100,35 @@ export default function RentCheckout() {
     try {
       // Step 1: Stripe pre-authorization (€30 hold)
       const { data: { clientSecret, paymentIntentId } } = await api.post('/api/rent/preauth');
-      setStatus('Paiement autorisé. Déverrouillage en cours...');
 
-      // Step 2: Create rental order via Factory API
-      const ejectRes = await api.post('/api/rent/eject', { deviceId, paymentIntentId });
+      // Step 2: Confirm the card payment with Stripe
+      // return_url uses the CURRENT domain dynamically — never hardcoded
+      const { error: confirmError, paymentIntent: confirmedPI } = await stripe.confirmCardPayment(clientSecret, {
+        payment_method: { card: elements.getElement(CardElement) },
+        return_url: `${window.location.origin}/rent/success?deviceId=${deviceId}`,
+      });
+
+      if (confirmError) {
+        setStatus('❌ Paiement refusé: ' + confirmError.message);
+        setLoading(false);
+        return;
+      }
+
+      // If the payment requires a redirect (3DS), Stripe handles it.
+      // If it succeeds immediately, we proceed to eject.
+      if (confirmedPI.status === 'requires_action' || confirmedPI.status === 'requires_redirect') {
+        // Stripe will redirect the user — no further action needed here
+        setStatus('Redirection vers votre banque pour validation...');
+        return;
+      }
+
+      // Step 3: Payment authorized — create rental order via Factory API to pop the battery
+      setStatus('Paiement autorisé. Déverrouillage en cours...');
+      const ejectRes = await api.post('/api/rent/eject', { deviceId, paymentIntentId: confirmedPI.id });
 
       if (ejectRes.data.success && ejectRes.data.tradeNo) {
-        // Step 3: Poll factory for rental order status
-        pollOrderStatus(ejectRes.data.tradeNo, paymentIntentId);
+        // Step 4: Poll factory for rental order status
+        pollOrderStatus(ejectRes.data.tradeNo, confirmedPI.id);
       } else {
         setStatus('❌ Échec: ' + (ejectRes.data.message || 'Erreur inconnue'));
         setLoading(false);

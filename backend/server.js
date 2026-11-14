@@ -244,9 +244,14 @@ app.post('/api/rent/preauth', async (req, res) => {
 app.get('/api/rent/checkout-link', async (req, res) => {
   const deviceId = req.query.deviceId || 'DTA55642';
   if (!stripe) return res.status(500).json({ error: 'Stripe is not configured (STRIPE_SECRET_KEY missing).' });
-  const host = req.get('host') || 'powerbank-app-im73.onrender.com';
-  const proto = req.get('x-forwarded-proto') || req.protocol || 'https';
-  const baseUrl = `${proto}://${host}`;
+
+  // ── Frontend URL for success/cancel redirects ──
+  // Use FRONTEND_URL env var, or infer from the Referer/Origin header, or fall back to the Vercel deployment
+  const frontendUrl = process.env.FRONTEND_URL
+    || (req.headers.origin ? req.headers.origin.replace(/\/$/, '') : null)
+    || (req.headers.referer ? new URL(req.headers.referer).origin : null)
+    || 'https://powerbank-app-two.vercel.app';
+
   try {
     const session = await stripe.checkout.sessions.create({
       line_items: [{
@@ -254,15 +259,16 @@ app.get('/api/rent/checkout-link', async (req, res) => {
           currency: 'eur',
           product_data: {
             name: 'Power Bank Rental — Caution (DTA55642)',
-            description: `Pré-autorisation de 30€ pour la location de batterie. Device: ${deviceId}`,
+            description: `Pre-autorisation de 30 EUR pour la location de batterie. Device: ${deviceId}`,
           },
           unit_amount: 3000,
         },
         quantity: 1,
       }],
       mode: 'payment',
-      success_url: `${baseUrl}/payment/success?deviceId=${deviceId}&session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${baseUrl}/payment/cancel?deviceId=${deviceId}`,
+      // ── Redirect to the FRONTEND success page, which will trigger /api/rent/eject ──
+      success_url: `${frontendUrl}/rent/success?deviceId=${deviceId}&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${frontendUrl}/?paid=cancel`,
       metadata: { deviceId },
     });
     res.json({ url: session.url, sessionId: session.id });
