@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Test QR Code - Power Bank Rental</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f8fafc; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px; }
+  .card { background: white; border-radius: 24px; box-shadow: 0 20px 60px rgba(0,0,0,0.1); padding: 40px; max-width: 480px; text-align: center; width: 100%; }
+  h1 { font-size: 24px; color: #1e293b; margin-bottom: 8px; }
+  .subtitle { color: #64748b; margin-bottom: 24px; }
+  .qr-container { background: white; padding: 20px; border-radius: 16px; border: 2px dashed #e2e8f0; margin: 20px 0; }
+  .qr-container img { max-width: 280px; width: 100%; height: auto; }
+  .url { background: #f1f5f9; padding: 12px 16px; border-radius: 8px; font-family: monospace; font-size: 13px; color: #475569; word-break: break-all; margin: 16px 0; }
+  .btn { display: inline-block; background: #6366f1; color: white; text-decoration: none; padding: 14px 32px; border-radius: 12px; font-weight: 700; font-size: 16px; margin-top: 16px; border: none; cursor: pointer; }
+  .btn-secondary { background: #22c55e; margin-left: 8px; }
+  .note { font-size: 13px; color: #94a3b8; margin-top: 20px; line-height: 1.5; }
+  .warning { background: #fef3c7; border: 1px solid #f59e0b; color: #92400e; padding: 12px; border-radius: 8px; font-size: 13px; margin-bottom: 16px; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>🔋 Test QR Code</h1>
+    <p class="subtitle">Scannez ce QR code pour tester le paiement</p>
+    
+    <div class="warning">
+      ⚠️ Mode test local uniquement. Le backend doit être en cours d'exécution sur localhost:3000.
+    </div>
+    
+    <div class="qr-container">
+      <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAZoAAAGaAQAAAAAefbjOAAADP0lEQVR4nO1cXY6jMAy2AamPIM0BepT0Bj3SqkeaG5CjzAFGKo8jBXnlnwAzuw/DtluGxt8DTQpWibGczz8UCVYjVutlAFzI4IowuCIMrgiDK8LgijC4IvakCDQ0gCeengZEiPJVN6JMFaf9rGklXOizIgIxrjIekS5dbYwzXGuiHmo5n1moa68ARQzZAUQ8EASxjZZIHIVcIB5ks9tbBRe6pyKIHUXeOhqd/p9f+hZcaHtFxG5E6ttkxhA7M5D7/9J34EIPV0Rjny1zhAEAAeoEMHRA8Zz4xJW/A1hmsvw5PbEiYMkYoWYK8bdDvkAYaP/D11S50M0WMWNBKvlA/Z+XuEWUE2sMsofMgScA/rrWJJmIRTiylzWtggtlLNwDtMuR2Ib6CM1HyP7hPqIQi+inaS9mocTBklP5BMcfbhGl8IirjNIntik8gr3FnNF0H1GMj2iNVKpTkNFim1CimdwiyslHBIswNAEh4CwEkmQmwhsCxdOBcBdrqlzodkVEKVporAFAl6O4DKEQfFAPwsnMm39pHVxo2wxVaxHGgkpaPkJGHmsUZBEhU4jMIyTctMKXkAkNPTzWKKauAXWCQCMStO9IAAlQaEU8p0bLHJvcXuVCW0WfZMRBdwg95GYZCTNygOpZ7CIMFqUX4nJME8c8EESeQvthAcaiLr6LNa2EC33NUNVTFmLmFkuX4fmIoswIucFWn7m4Ai1ttUmdByIeiOjNu+p2+XD/MUP1yi0yKJyBo4vhJSEfKB4zpYxn2smaKhe6R6wBgGF65Nw+RQAfnLNseMcYGxlhkBSVq9zw1F11qWEfkYAz1pyfbCiezErwi7389DVVLnTXHiqyqlYugFp9y/rrPPosw0egzeokjoAARsDQ814Bo9IKfbXn0bdXudBGighTBwR351s+gl/6w45Ps6OY2+38ORVS1wAtds5Nt2IHWv1ieH9EabGGYUDZNRq2Em6IkK2DN5bB+yOKFArsMmLHJQ3ObEu0yfuHJjO9P6IYoTa/m3ER4gD8HwGyazCj4GYZSWZudnur4EL3fKeLxAtM7VNa0ph4p9c+n9/20P+ZbBfPqXIhhSvC4IowuCIMrgiDK8LwOEX8BoQ9cewYj/uIAAAAAElFTkSuQmCC" alt="QR Code">
+    </div>
+    
+    <div class="url">http://localhost:3000/pay/DTA55642</div>
+    
+    <a href="http://localhost:3000/pay/DTA55642" class="btn" target="_blank">Ouvrir le lien</a>
+    <a href="http://localhost:3000/api/rent/checkout-link?deviceId=DTA55642" class="btn btn-secondary" target="_blank">API Test</a>
+    
+    <p class="note">
+      Ce QR code pointe vers <strong>localhost:3000</strong>.<br>
+      Pour le rendre accessible publiquement, déployez le backend sur Render.<br><br>
+      <strong>Flux:</strong> QR → /pay/DTA55642 → Stripe Checkout → /payment/success
+    </p>
+  </div>
+</body>
+</html>
