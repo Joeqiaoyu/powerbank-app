@@ -354,7 +354,21 @@ app.get('/payment/cancel', (req, res) => {
 // ── 4. POST /api/rent/eject — Create a Rental Order (Factory: POST /rent/order/create)
 app.post('/api/rent/eject', async (req, res) => {
   const { deviceId, paymentIntentId } = req.body;
+
+  // ── Pre-flight logging ──
+  console.log('[FACTORY API] Attempting to eject device:', deviceId);
+  console.log('[FACTORY API] Credentials exist check - USER:', !!process.env.FACTORY_USERNAME, 'PASS:', !!process.env.FACTORY_PASSWORD);
+  console.log('[FACTORY API] Base URL:', FACTORY_BASE_URL);
+  console.log('[FACTORY API] Callback URL:', CALLBACK_URL);
+
+  if (!deviceId) {
+    console.error('[FACTORY API ERROR] No deviceId provided in request body');
+    return res.status(400).json({ success: false, message: 'No deviceId provided.' });
+  }
+
   try {
+    console.log('[FACTORY API] Sending POST to /rent/order/create with params:', { deviceId, callbackURL: CALLBACK_URL });
+
     const response = await factoryApi.post('/rent/order/create', null, {
       params: {
         deviceId,
@@ -362,36 +376,70 @@ app.post('/api/rent/eject', async (req, res) => {
       },
     });
 
+    // ── Log full factory response ──
+    console.log('[FACTORY API] Response status:', response.status);
+    console.log('[FACTORY API] Response data:', JSON.stringify(response.data, null, 2));
+
     if (response.data.code !== 0) {
       // Factory rejected the order — instantly release the Stripe hold
-      if (paymentIntentId) await stripe.paymentIntents.cancel(paymentIntentId);
+      console.error('[FACTORY API ERROR] Factory rejected order. Code:', response.data.code, 'Msg:', response.data.msg);
+      if (paymentIntentId && stripe) await stripe.paymentIntents.cancel(paymentIntentId);
       return res.status(400).json({
         success: false,
         message: 'Échec du déverrouillage, caution annulée: ' + response.data.msg,
+        factoryCode: response.data.code,
+        factoryMsg: response.data.msg,
       });
     }
 
     const tradeNo = response.data.data?.tradeNo;
+    console.log('[FACTORY API] Success! TradeNo:', tradeNo);
+
     res.json({
       success: true,
       tradeNo,
       message: 'Commande créée, déverrouillage en cours...',
     });
   } catch (error) {
-    if (paymentIntentId) await stripe.paymentIntents.cancel(paymentIntentId);
-    res.status(500).json({ error: 'System error, caution released: ' + error.message });
+    // ── Deep error logging ──
+    console.error('[FACTORY API ERROR] Status:', error.response?.status);
+    console.error('[FACTORY API ERROR] Raw Data:', JSON.stringify(error.response?.data, null, 2));
+    console.error('[FACTORY API ERROR] Request config:', {
+      url: error.config?.url,
+      method: error.config?.method,
+      params: error.config?.params,
+      authHeader: error.config?.auth ? 'Basic Auth present' : 'NO AUTH',
+      baseURL: error.config?.baseURL,
+    });
+    console.error('[FACTORY API ERROR] Error code:', error.code);
+    console.error('[FACTORY API ERROR] Error message:', error.message);
+
+    if (paymentIntentId && stripe) await stripe.paymentIntents.cancel(paymentIntentId);
+
+    res.status(500).json({
+      success: false,
+      error: 'System error, caution released: ' + error.message,
+      factoryError: {
+        status: error.response?.status,
+        data: error.response?.data,
+        code: error.code,
+      },
+    });
   }
 });
 
 // ── 5. POST /api/rent/status — Query Rental Order Status (Factory: POST /rent/order/query)
 app.post('/api/rent/status', async (req, res) => {
   const { tradeNo } = req.body;
+  console.log('[FACTORY API] Polling order status for tradeNo:', tradeNo);
   try {
     const response = await factoryApi.post('/rent/order/query', null, {
       params: { tradeNo },
     });
 
     const success = response.data.code === 0;
+    console.log('[FACTORY API] Order status response:', JSON.stringify(response.data, null, 2));
+
     res.json({
       success,
       code: response.data.code,
@@ -399,7 +447,8 @@ app.post('/api/rent/status', async (req, res) => {
       callbackResult: rentalResults.get(tradeNo) || null,
     });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    console.error('[FACTORY API ERROR] Status query failed - Status:', error.response?.status, 'Data:', JSON.stringify(error.response?.data));
+    res.status(500).json({ error: error.message, factoryError: { status: error.response?.status, data: error.response?.data } });
   }
 });
 
