@@ -651,22 +651,42 @@ app.post('/api/rent/callback', async (req, res) => {
     String(factoryStatus).toLowerCase().includes(kw)
   );
 
-  if (isReturnEvent && tradeNo) {
-    console.log(`[FACTORY CALLBACK] *** RETURN EVENT detected for tradeNo=${tradeNo}. Triggering settlement... ***`);
+  if (isReturnEvent) {
+    console.log(`[FACTORY CALLBACK] *** RETURN EVENT detected. tradeNo=${tradeNo || 'N/A'}, batteryId=${batteryId || 'N/A'}, deviceId=${deviceId || 'N/A'}. Triggering settlement... ***`);
 
-    // ── Trigger settlement inline ──
-    const record = rentalRecords.get(tradeNo);
+    // ── CROSS-STATION SAFE record lookup ──
+    // 1. Try by tradeNo first
+    let record = tradeNo ? rentalRecords.get(tradeNo) : null;
+    let resolvedTradeNo = tradeNo;
+
+    // 2. If no match by tradeNo, try reverse lookup by batteryId
+    //    (cross-station safe: batteryId is tied to the battery, not the station)
+    if (!record && batteryId) {
+      console.log(`[FACTORY CALLBACK] No record by tradeNo. Trying reverse lookup by batteryId=${batteryId}...`);
+      for (const [tn, rec] of rentalRecords.entries()) {
+        if (rec.status === 'active' && rec.batteryId && rec.batteryId === batteryId) {
+          record = rec;
+          resolvedTradeNo = tn;
+          console.log(`[FACTORY CALLBACK] *** MATCH by batteryId! tradeNo=${tn} ***`);
+          break;
+        }
+      }
+    }
+
+    // CRITICAL: Do NOT match by device_id!
+    // In cross-station returns, device_id is the RETURN station, not the dispensing station.
+
     if (record && record.status === 'active') {
       try {
-        await settleRental(tradeNo, record, body.returnDeviceId || body.return_device_id || deviceId, batteryId);
-        console.log(`[FACTORY CALLBACK] Settlement completed for tradeNo=${tradeNo}`);
+        await settleRental(resolvedTradeNo, record, body.returnDeviceId || body.return_device_id || deviceId, batteryId);
+        console.log(`[FACTORY CALLBACK] Settlement completed for tradeNo=${resolvedTradeNo}`);
       } catch (err) {
-        console.error(`[FACTORY CALLBACK] Settlement FAILED for tradeNo=${tradeNo}:`, err.message);
+        console.error(`[FACTORY CALLBACK] Settlement FAILED for tradeNo=${resolvedTradeNo}:`, err.message);
       }
     } else if (record && record.status === 'completed') {
-      console.log(`[FACTORY CALLBACK] tradeNo=${tradeNo} already completed, ignoring.`);
+      console.log(`[FACTORY CALLBACK] tradeNo=${resolvedTradeNo} already completed, ignoring.`);
     } else {
-      console.warn(`[FACTORY CALLBACK] No active rental record for tradeNo=${tradeNo}. Cannot settle.`);
+      console.warn(`[FACTORY CALLBACK] No active rental record found. Tried tradeNo=${tradeNo}, batteryId=${batteryId}. Cannot settle.`);
     }
   }
 
@@ -831,56 +851,117 @@ app.post('/api/webhook/factory/return', async (req, res) => {
   console.log(`  factoryStatus:    ${factoryStatus || 'NOT FOUND'}`);
 
   // ── Step 1: Find the rental record ──
-  // Try by orderId/tradeNo first
+  // CROSS-STATION SAFE MATCHING STRATEGY (in priority order):
+  //
+  // 1. Direct match by orderId/tradeNo (best case — Factory sends our tradeNo)
+  // 2. Reverse lookup by batteryId (Factory sends battery_id without our tradeNo)
+  // 3. Factory API /rent/order/query fallback (Factory sends its own order_id/sn)
+  //
+  // CRITICAL: We do NOT match by device_id!
+  // In a cross-station return (rented at Station A, returned at Station B),
+  // the webhook's device_id is Station B — the RETURN station, not the dispensing station.
+  // Matching by device_id would find the wrong order (or no order).
   let record = null;
   let resolvedOrderId = null;
+  let matchStrategy = 'NONE';
 
+  // ── Strategy 1: Direct match by orderId / tradeNo ──
   if (orderId) {
     record = rentalRecords.get(orderId);
-    resolvedOrderId = orderId;
+    if (record) {
+      resolvedOrderId = orderId;
+      matchStrategy = 'TRADE_NO_DIRECT';
+      console.log(`[WEBHOOK RETURN] *** MATCH by tradeNo=${orderId} ***`);
+    }
   }
 
-  // ── If no record found by orderId, try reverse lookup by batteryId ──
-  // The Factory may send only a battery_id without our tradeNo
+  // ── Strategy 2: Reverse lookup by batteryId ──
+  // The Factory may send only a battery_id without our tradeNo.
+  // We search all ACTIVE rental records for one with a matching batteryId.
+  // This is cross-station safe: batteryId is tied to the battery, not the station.
   if (!record && batteryId) {
-    console.log(`[WEBHOOK RETURN] No record found by orderId. Trying reverse lookup by batteryId=${batteryId}...`);
+    console.log(`[WEBHOOK RETURN] Strategy 2: Reverse lookup by batteryId=${batteryId}...`);
     for (const [tn, rec] of rentalRecords.entries()) {
       if (rec.status === 'active') {
-        console.log(`[WEBHOOK RETURN] Checking active record: tradeNo=${tn}, batteryId=${rec.batteryId || 'N/A'}, deviceId=${rec.deviceId}`);
-        if (rec.batteryId === batteryId) {
+        console.log(`[WEBHOOK RETURN]   Checking: tradeNo=${tn}, batteryId=${rec.batteryId || 'N/A'}, deviceId=${rec.deviceId}`);
+        if (rec.batteryId && rec.batteryId === batteryId) {
           record = rec;
           resolvedOrderId = tn;
-          console.log(`[WEBHOOK RETURN] *** MATCH FOUND by batteryId! tradeNo=${tn} ***`);
+          matchStrategy = 'BATTERY_ID_REVERSE';
+          console.log(`[WEBHOOK RETURN] *** MATCH by batteryId! tradeNo=${tn} ***`);
           break;
         }
       }
     }
+    if (!record) {
+      console.warn(`[WEBHOOK RETURN] batteryId=${batteryId} did not match any active rental.`);
+    }
   }
 
-  // ── If still no record, try reverse lookup by deviceId (for active rentals on that device) ──
-  if (!record && deviceId) {
-    console.log(`[WEBHOOK RETURN] No record found by batteryId. Trying reverse lookup by deviceId=${deviceId}...`);
-    for (const [tn, rec] of rentalRecords.entries()) {
-      if (rec.status === 'active' && rec.deviceId === deviceId) {
-        record = rec;
-        resolvedOrderId = tn;
-        console.log(`[WEBHOOK RETURN] *** MATCH FOUND by deviceId! tradeNo=${tn} (most recent active rental on this device) ***`);
-        break;
+  // ── Strategy 3: Factory API /rent/order/query fallback ──
+  // If the Factory sent its own order_id or sn (not our tradeNo), we can query
+  // the Factory API to get the full order details, which should include our tradeNo
+  // or the batteryId we need.
+  if (!record && orderId) {
+    console.log(`[WEBHOOK RETURN] Strategy 3: Querying Factory API for orderId=${orderId}...`);
+    try {
+      const factoryQueryRes = await factoryApi.post('/rent/order/query', null, {
+        params: { tradeNo: orderId },
+      });
+      const factoryOrderData = factoryQueryRes.data?.data;
+      console.log(`[WEBHOOK RETURN] Factory order/query response:`, JSON.stringify(factoryQueryRes.data, null, 2));
+
+      if (factoryOrderData) {
+        // The Factory's order/query should return the tradeNo we originally sent
+        const factoryTradeNo = factoryOrderData.tradeNo || factoryOrderData.trade_no;
+        if (factoryTradeNo) {
+          record = rentalRecords.get(factoryTradeNo);
+          if (record) {
+            resolvedOrderId = factoryTradeNo;
+            matchStrategy = 'FACTORY_QUERY_TRADE_NO';
+            console.log(`[WEBHOOK RETURN] *** MATCH via Factory query! tradeNo=${factoryTradeNo} ***`);
+          }
+        }
+
+        // If still no match, try batteryId from Factory query response
+        if (!record) {
+          const factoryBatteryId = factoryOrderData.batteryId || factoryOrderData.battery_id || factoryOrderData.batterySn || factoryOrderData.battery_sn;
+          if (factoryBatteryId) {
+            console.log(`[WEBHOOK RETURN] Factory returned batteryId=${factoryBatteryId}. Trying reverse lookup...`);
+            for (const [tn, rec] of rentalRecords.entries()) {
+              if (rec.status === 'active' && rec.batteryId && rec.batteryId === factoryBatteryId) {
+                record = rec;
+                resolvedOrderId = tn;
+                matchStrategy = 'FACTORY_QUERY_BATTERY_ID';
+                console.log(`[WEBHOOK RETURN] *** MATCH via Factory query batteryId! tradeNo=${tn} ***`);
+                break;
+              }
+            }
+          }
+        }
+
+        // ── BONUS: If Factory query shows the battery is already returned,
+        // and we found the record above, settlement will be triggered below.
+        // If we STILL haven't found the record, log all active records for debugging. ──
       }
+    } catch (factoryErr) {
+      console.warn(`[WEBHOOK RETURN] Factory /rent/order/query failed:`, factoryErr.message);
     }
   }
 
   // ── If no record found at all, respond success (Factory won't retry) ──
   if (!record) {
-    console.warn(`[WEBHOOK RETURN] No rental record found. Tried orderId=${orderId}, batteryId=${batteryId}, deviceId=${deviceId}. Responding success to prevent Factory retries.`);
+    console.warn(`[WEBHOOK RETURN] ❌ NO MATCH FOUND. Tried: ${matchStrategy}. Tried orderId=${orderId}, batteryId=${batteryId}. Responding success to prevent Factory retries.`);
     // Log all active rental records for debugging
     const activeRecords = [];
     for (const [tn, rec] of rentalRecords.entries()) {
-      if (rec.status === 'active') activeRecords.push({ tradeNo: tn, deviceId: rec.deviceId, batteryId: rec.batteryId });
+      if (rec.status === 'active') activeRecords.push({ tradeNo: tn, deviceId: rec.deviceId, batteryId: rec.batteryId || 'N/A' });
     }
-    console.log(`[WEBHOOK RETURN] Active rental records in memory: ${activeRecords.length}`, JSON.stringify(activeRecords, null, 2));
+    console.log(`[WEBHOOK RETURN] Active rental records in memory (${activeRecords.length}):`, JSON.stringify(activeRecords, null, 2));
     return res.json({ code: 0, msg: 'success' });
   }
+
+  console.log(`[WEBHOOK RETURN] Match strategy: ${matchStrategy}. Resolved orderId: ${resolvedOrderId}`);
 
   // ── If already completed, ignore duplicate ──
   if (record.status === 'completed') {

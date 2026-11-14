@@ -109,30 +109,45 @@ export default function ActiveRental() {
   }, [rentalStatus, startTimeMs]);
 
   // ── Backend polling: check for battery return every 5 seconds ──
+  // CRITICAL: This interval MUST clear itself the instant status='completed' is detected.
+  // Both the polling interval AND the 1-second tick clock must stop immediately.
   useEffect(() => {
     if (rentalStatus !== 'active') return;
 
+    // Use a local flag to prevent race conditions between interval fires
+    let settled = false;
+
     pollRef.current = setInterval(async () => {
+      // Guard: if already settled by a previous interval fire, skip
+      if (settled) return;
+
       setPollCount(prev => prev + 1);
+
       try {
         const { data } = await api.get(`/api/rent/status/${orderId}`);
 
         // ── POLLING FAILSAFE: log every response for debugging ──
         console.log("[POLL RESPONSE]", {
+          pollNumber: pollCount + 1,
           status: data.status,
           orderId: data.orderId,
           totalDuration: data.totalDuration,
           finalCost: data.finalCost,
-          billing: data.billing,
+          hasBilling: !!data.billing,
           raw: data,
         });
 
+        // ── STRICT CHECK: status must be exactly 'completed' ──
         if (data.status === 'completed') {
+          settled = true; // Prevent any further processing
+
           // ── CRITICAL: Clear BOTH intervals IMMEDIATELY ──
-          // The tick clock and the polling interval must stop the instant
-          // we detect completion. Any delay causes the timer to keep ticking.
-          clearInterval(pollRef.current);
-          pollRef.current = null;
+          // The tick clock (1s) and the polling interval (5s) must stop
+          // the instant we detect completion.
+          if (pollRef.current) {
+            clearInterval(pollRef.current);
+            pollRef.current = null;
+          }
           if (tickRef.current) {
             clearInterval(tickRef.current);
             tickRef.current = null;
@@ -145,16 +160,15 @@ export default function ActiveRental() {
           setTimeout(() => {
             navigate(`/rent/summary?orderId=${orderId}`);
           }, 1200);
-          return; // Stop further polling
+          return;
         }
 
-        // ── If backend returned a different startTime, sync it ──
-        if (data.startTime && data.startTime !== startTimeMs?.toString()) {
+        // ── Sync startTime from backend if we don't have it yet ──
+        // (handles case where initial fetch failed to parse it)
+        if (data.startTime && !startTimeMs) {
           const ms = new Date(data.startTime).getTime();
           if (!isNaN(ms)) {
             setStartTimeMs(ms);
-            const elapsed = Math.floor((Date.now() - ms) / 1000);
-            setElapsedSeconds(elapsed > 0 ? elapsed : 0);
           }
         }
       } catch (err) {
@@ -164,11 +178,18 @@ export default function ActiveRental() {
           status: err.response?.status,
           data: err.response?.data,
         });
+        // Do NOT change rentalStatus on poll error — keep timer running.
+        // The backend may be cold-starting (Render free tier). Next poll may succeed.
       }
     }, 5000);
 
-    return () => { if (pollRef.current) clearInterval(pollRef.current); };
-  }, [rentalStatus, orderId, navigate]);
+    return () => {
+      if (pollRef.current) {
+        clearInterval(pollRef.current);
+        pollRef.current = null;
+      }
+    };
+  }, [rentalStatus, orderId, navigate]); // Note: startTimeMs intentionally excluded — synced inside interval
 
   // ── Calculate live cost estimate ──
   const elapsedMinutes = Math.floor(elapsedSeconds / 60);

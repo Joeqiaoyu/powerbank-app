@@ -5,6 +5,18 @@ import axios from 'axios';
 const API_BASE = import.meta.env.VITE_API_URL || 'https://powerbank-app-im73.onrender.com';
 const api = axios.create({ baseURL: API_BASE, timeout: 30000 });
 
+// ── Format duration for French display: "01h 15m" or "5m 30s" ──
+function formatDurationFrench(seconds) {
+  if (!seconds || seconds < 0) return '0 min';
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  if (h > 0) {
+    return `${String(h).padStart(2, '0')}h ${String(m).padStart(2, '0')}m`;
+  }
+  const s = seconds % 60;
+  return `${m}m ${String(s).padStart(2, '0')}s`;
+}
+
 export default function RentSummary() {
   const [searchParams] = useSearchParams();
   const orderId = searchParams.get('orderId') || searchParams.get('tradeNo');
@@ -17,7 +29,7 @@ export default function RentSummary() {
 
   useEffect(() => {
     if (!orderId) {
-      setError("Aucun identifiant de commande trouve.");
+      setError("Aucun identifiant de commande trouvé.");
       setLoading(false);
       loadingRef.current = false;
       return;
@@ -26,6 +38,14 @@ export default function RentSummary() {
     const fetchSummary = async () => {
       try {
         const { data } = await api.get(`/api/rent/status/${orderId}`);
+
+        console.log("[SUMMARY FETCH]", {
+          status: data.status,
+          finalCost: data.finalCost,
+          totalDuration: data.totalDuration,
+          hasBilling: !!data.billing,
+          raw: data,
+        });
 
         if (data.status === 'completed') {
           setRecord(data);
@@ -41,7 +61,7 @@ export default function RentSummary() {
         }
       } catch (err) {
         const errMsg = err.code === 'ECONNABORTED'
-          ? 'Le serveur met trop de temps a repondre.'
+          ? 'Le serveur met trop de temps à répondre.'
           : (err.response?.data?.error || err.message);
         setError(errMsg);
         setLoading(false);
@@ -65,7 +85,7 @@ export default function RentSummary() {
     const timeout = setTimeout(() => {
       clearInterval(pollInterval);
       if (loadingRef.current) {
-        setError('Delai depasse. La location est peut-etre toujours en cours.');
+        setError('Délai dépassé. La location est peut-être toujours en cours.');
         setLoading(false);
         loadingRef.current = false;
       }
@@ -88,7 +108,7 @@ export default function RentSummary() {
             Veuillez patienter pendant le calcul du montant.
           </p>
           <p className="text-gray-400 text-xs mt-4">
-            Commande: <span className="font-mono">{orderId}</span>
+            Commande : <span className="font-mono">{orderId}</span>
           </p>
         </div>
       </div>
@@ -107,18 +127,19 @@ export default function RentSummary() {
             onClick={() => navigate('/')}
             className="w-full bg-blue-500 text-white py-3 rounded-xl font-bold hover:bg-blue-600 transition"
           >
-            Retour a la carte
+            Retour à la carte
           </button>
         </div>
       </div>
     );
   }
 
-  // ── Success receipt ──
+  // ── Extract billing data ──
   const billing = record?.billing;
   const chargeAmount = billing ? billing.chargeAmountEur : (record?.finalCost || 0);
-  const releasedAmount = billing ? billing.releasedAmountEur : (record?.depositReleased || 30 - chargeAmount);
-  const durationDisplay = billing?.durationDisplay || record?.totalDuration || '0 h 0 min';
+  const releasedAmount = billing ? billing.releasedAmountEur : (30 - chargeAmount);
+  const totalDurationSeconds = billing?.durationSeconds || record?.totalDurationSeconds || 0;
+  const durationDisplay = formatDurationFrench(totalDurationSeconds);
   const isFree = chargeAmount === 0;
 
   return (
@@ -133,17 +154,17 @@ export default function RentSummary() {
             </svg>
           </div>
           <h1 className="text-2xl font-bold text-green-700">
-            Batterie retournee avec succes
+            ✅ Location terminée
           </h1>
           <p className="text-gray-500 text-sm mt-2">
-            Votre location est terminee. Merci !
+            Votre location est terminée. Merci !
           </p>
         </div>
 
         {/* ── Receipt details ── */}
         <div className="bg-gray-50 rounded-2xl p-6 mb-6 space-y-5">
 
-          {/* Duration */}
+          {/* ── Durée totale ── */}
           <div className="flex justify-between items-center">
             <div className="flex items-center gap-3">
               <div className="w-10 h-10 bg-indigo-100 rounded-full flex items-center justify-center">
@@ -152,7 +173,7 @@ export default function RentSummary() {
                   <path strokeLinecap="round" d="M12 7v5l3 2" />
                 </svg>
               </div>
-              <span className="text-gray-600 text-sm font-medium">Temps total de location</span>
+              <span className="text-gray-600 text-sm font-medium">Durée totale</span>
             </div>
             <span className="text-gray-900 font-bold text-lg">{durationDisplay}</span>
           </div>
@@ -160,7 +181,7 @@ export default function RentSummary() {
           {/* Divider */}
           <div className="border-t border-gray-200" />
 
-          {/* Amount charged */}
+          {/* ── Montant prélevé ── */}
           <div className="flex justify-between items-center">
             <div className="flex items-center gap-3">
               <div className="w-10 h-10 bg-blue-100 rounded-full flex items-center justify-center">
@@ -168,14 +189,14 @@ export default function RentSummary() {
                   <path strokeLinecap="round" strokeLinejoin="round" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1" />
                 </svg>
               </div>
-              <span className="text-gray-600 text-sm font-medium">Montant facture</span>
+              <span className="text-gray-600 text-sm font-medium">Montant prélevé</span>
             </div>
             <div className="text-right">
               <span className="text-gray-900 font-bold text-lg">
                 {chargeAmount.toFixed(2).replace('.', ',')} €
               </span>
               {isFree && (
-                <p className="text-green-500 text-xs font-semibold">Gratuit (periode d'essai)</p>
+                <p className="text-green-500 text-xs font-semibold">Gratuit (période d'essai)</p>
               )}
             </div>
           </div>
@@ -183,7 +204,7 @@ export default function RentSummary() {
           {/* Divider */}
           <div className="border-t border-gray-200" />
 
-          {/* Deposit released */}
+          {/* ── Caution libérée ── */}
           <div className="flex justify-between items-center">
             <div className="flex items-center gap-3">
               <div className="w-10 h-10 bg-green-100 rounded-full flex items-center justify-center">
@@ -198,7 +219,7 @@ export default function RentSummary() {
             </span>
           </div>
 
-          {/* Cross-station indicator */}
+          {/* ── Cross-station indicator ── */}
           {billing?.crossStationReturn && (
             <>
               <div className="border-t border-gray-200" />
@@ -232,14 +253,14 @@ export default function RentSummary() {
         {/* ── Bank refund note ── */}
         <div className="bg-blue-50 border border-blue-100 rounded-xl p-4 mb-6">
           <p className="text-blue-700 text-xs text-center">
-            La caution restante a ete automatiquement libérée sur votre carte.
-            Selon votre banque, le remboursement peut prendre 3-5 jours ouvres.
+            La caution restante a été automatiquement libérée sur votre carte.
+            Selon votre banque, le remboursement peut prendre 3 à 5 jours ouvrés.
           </p>
         </div>
 
         {/* ── Order ID ── */}
         <p className="text-gray-400 text-xs text-center mb-4">
-          N° de commande: <span className="font-mono">{orderId}</span>
+          N° de commande : <span className="font-mono">{orderId}</span>
         </p>
 
         {/* ── Return button ── */}
