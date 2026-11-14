@@ -540,6 +540,47 @@ app.post('/api/rent/eject', async (req, res) => {
     console.log(`[RENTAL RECORD] Created: tradeNo=${tradeNo}, deviceId=${deviceId}, batteryId=${batteryId || 'N/A'}, paymentIntentId=${paymentIntentId || 'NONE'}`);
     console.log(`[RENTAL RECORD] Full record:`, JSON.stringify(rentalRecords.get(tradeNo), null, 2));
 
+    // ── ASYNC BATTERY ID FETCH: Query Factory /rent/order/query after a short delay ──
+    // The Factory's /rent/order/create response does NOT include batteryId.
+    // However, the /rent/order/query endpoint may return it once the battery has been
+    // physically ejected and the Factory's system has registered which battery popped out.
+    // We retry a few times because the physical ejection takes a few seconds.
+    if (!batteryId) {
+      console.log(`[BATTERY ID FETCH] No batteryId at creation time. Scheduling async retries for tradeNo=${tradeNo}...`);
+      const retryDelays = [2000, 4000, 8000]; // 2s, 4s, 8s after eject
+      retryDelays.forEach((delay, i) => {
+        setTimeout(async () => {
+          try {
+            const retryRes = await factoryApi.post('/rent/order/query', null, {
+              params: { tradeNo },
+            });
+            const retryData = retryRes.data?.data;
+            console.log(`[BATTERY ID FETCH] Retry ${i + 1}/${retryDelays.length} for tradeNo=${tradeNo}:`, JSON.stringify(retryRes.data, null, 2));
+
+            if (retryData) {
+              const fetchedBatteryId = retryData.batteryId || retryData.battery_id || retryData.batterySn || retryData.battery_sn || retryData.powerBankId || retryData.power_bank_id || null;
+              if (fetchedBatteryId) {
+                // Update the rental record with the fetched batteryId
+                const rec = rentalRecords.get(tradeNo);
+                if (rec && rec.status === 'active') {
+                  rec.batteryId = fetchedBatteryId;
+                  rentalRecords.set(tradeNo, rec);
+                  console.log(`[BATTERY ID FETCH] ✅ SUCCESS! Updated tradeNo=${tradeNo} with batteryId=${fetchedBatteryId} (retry ${i + 1})`);
+                } else {
+                  console.log(`[BATTERY ID FETCH] Got batteryId=${fetchedBatteryId} but record is no longer active (status=${rec?.status || 'MISSING'}). Skipping update.`);
+                }
+                return; // Got it, stop retrying
+              } else {
+                console.log(`[BATTERY ID FETCH] Retry ${i + 1}: No batteryId in Factory query response. Available keys: ${Object.keys(retryData).join(', ')}`);
+              }
+            }
+          } catch (retryErr) {
+            console.warn(`[BATTERY ID FETCH] Retry ${i + 1} failed for tradeNo=${tradeNo}:`, retryErr.message);
+          }
+        }, delay);
+      });
+    }
+
     res.json({
       success: true,
       tradeNo,
@@ -651,6 +692,10 @@ app.get('/api/rent/detail', async (req, res) => {
 // This endpoint stores the callback data AND checks if the battery was returned.
 // If a return is detected, it triggers settlement inline (since CALLBACK_URL may point here).
 app.post('/api/rent/callback', async (req, res) => {
+  // ── RAW PAYLOAD LOG (very first line) ──
+  console.log('[CROSS-STATION CALLBACK RAW PAYLOAD]:', JSON.stringify(req.body, null, 2));
+  console.log('[CROSS-STATION CALLBACK QUERY PARAMS]:', JSON.stringify(req.query, null, 2));
+
   // ── Deep logging: catch everything the Factory sends ──
   console.log('[FACTORY CALLBACK] Headers:', JSON.stringify(req.headers, null, 2));
   console.log('[FACTORY CALLBACK] Body (raw):', JSON.stringify(req.body, null, 2));
@@ -659,7 +704,7 @@ app.post('/api/rent/callback', async (req, res) => {
   // ── Store callback data for debugging/polling ──
   const body = req.body || {};
   // Try every possible field name for the order identifier
-  const tradeNo = body.tradeNo || body.order_id || body.orderId || body.orderId || body.sn || body.orderNo;
+  const tradeNo = body.tradeNo || body.trade_no || body.order_id || body.orderId || body.sn || body.orderNo;
   const batteryId = body.batteryId || body.battery_id || body.batterySn || body.battery_sn;
   const deviceId = body.deviceId || body.device_id || body.cabinetId || body.cabinet_id;
   const factoryStatus = body.status || body.type || body.event || body.action;
@@ -672,14 +717,21 @@ app.post('/api/rent/callback', async (req, res) => {
   }
 
   // ── Check if this callback indicates a battery return ──
-  // Factory may send status='returned', type='return', event='battery_return', etc.
+  // Factory sends numeric status codes:
+  //   "1" = active/rented
+  //   "2" = returned (confirmed from live callback data)
+  //   other non-"1" values = likely returned/ended
+  // We also check English keywords as backup.
   const returnKeywords = ['return', 'returned', 'end', 'ended', 'finish', 'finished', 'complete', 'completed'];
-  const isReturnEvent = factoryStatus && returnKeywords.some(kw =>
+  const isReturnKeyword = factoryStatus && returnKeywords.some(kw =>
     String(factoryStatus).toLowerCase().includes(kw)
   );
+  // CRITICAL: Numeric status detection — any status that's not "1" (active) indicates return
+  const isNumericReturn = factoryStatus && String(factoryStatus).trim() !== '1' && String(factoryStatus).trim() !== '';
+  const isReturnEvent = isReturnKeyword || isNumericReturn;
 
   if (isReturnEvent) {
-    console.log(`[FACTORY CALLBACK] *** RETURN EVENT detected. tradeNo=${tradeNo || 'N/A'}, batteryId=${batteryId || 'N/A'}, deviceId=${deviceId || 'N/A'}. Triggering settlement... ***`);
+    console.log(`[FACTORY CALLBACK] *** RETURN EVENT detected (status="${factoryStatus}", numericReturn=${isNumericReturn}, keywordMatch=${isReturnKeyword}). tradeNo=${tradeNo || 'N/A'}, batteryId=${batteryId || 'N/A'}, deviceId=${deviceId || 'N/A'}. Triggering settlement... ***`);
 
     // ── CROSS-STATION SAFE record lookup ──
     // 1. Try by tradeNo first
@@ -702,6 +754,75 @@ app.post('/api/rent/callback', async (req, res) => {
 
     // CRITICAL: Do NOT match by device_id!
     // In cross-station returns, device_id is the RETURN station, not the dispensing station.
+
+    // 3. If still no match, try Factory API query with the tradeNo we received
+    if (!record && tradeNo) {
+      console.log(`[FACTORY CALLBACK] No local match. Querying Factory API for tradeNo=${tradeNo}...`);
+      try {
+        const factoryQ = await factoryApi.post('/rent/order/query', null, {
+          params: { tradeNo },
+        });
+        const fqData = factoryQ.data?.data;
+        console.log(`[FACTORY CALLBACK] Factory query response:`, JSON.stringify(factoryQ.data, null, 2));
+        if (fqData) {
+          const fqTradeNo = fqData.tradeNo || fqData.trade_no;
+          if (fqTradeNo) {
+            record = rentalRecords.get(fqTradeNo);
+            if (record) {
+              resolvedTradeNo = fqTradeNo;
+              console.log(`[FACTORY CALLBACK] *** MATCH via Factory query! tradeNo=${fqTradeNo} ***`);
+            }
+          }
+          // Also try batteryId from Factory query
+          if (!record) {
+            const fqBatteryId = fqData.batteryId || fqData.battery_id || fqData.batterySn || fqData.battery_sn;
+            if (fqBatteryId) {
+              for (const [tn, rec] of rentalRecords.entries()) {
+                if (rec.status === 'active' && rec.batteryId && rec.batteryId === fqBatteryId) {
+                  record = rec;
+                  resolvedTradeNo = tn;
+                  console.log(`[FACTORY CALLBACK] *** MATCH via Factory query batteryId! tradeNo=${tn} ***`);
+                  break;
+                }
+              }
+            }
+          }
+        }
+      } catch (fqErr) {
+        console.warn(`[FACTORY CALLBACK] Factory query failed:`, fqErr.message);
+      }
+    }
+
+    // 4. BROAD SCAN: If we still have no match but know a return happened,
+    //    query Factory API for ALL active orders to find which one is returned
+    if (!record) {
+      console.log(`[FACTORY CALLBACK] No match yet. Broad scanning all active orders...`);
+      for (const [tn, rec] of rentalRecords.entries()) {
+        if (rec.status !== 'active') continue;
+        try {
+          const scanRes = await factoryApi.post('/rent/order/query', null, {
+            params: { tradeNo: tn },
+          });
+          const scanData = scanRes.data?.data;
+          const scanStatus = String(scanData?.status ?? '').trim();
+          if (scanStatus && scanStatus !== '1' && scanStatus !== '') {
+            // This order's Factory status is not "1" (active) — it's returned!
+            record = rec;
+            resolvedTradeNo = tn;
+            // Save the batteryId if we found it
+            const scanBatteryId = scanData?.batteryId || scanData?.battery_id || scanData?.batterySn || scanData?.battery_sn;
+            if (scanBatteryId) {
+              rec.batteryId = scanBatteryId;
+              rentalRecords.set(tn, rec);
+            }
+            console.log(`[FACTORY CALLBACK] *** MATCH via broad scan! tradeNo=${tn}, Factory status="${scanStatus}" ***`);
+            break;
+          }
+        } catch (scanErr) {
+          // Skip failed queries
+        }
+      }
+    }
 
     if (record && record.status === 'active') {
       try {
@@ -847,6 +968,12 @@ async function settleRental(orderId, record, returnDeviceId, batteryId) {
 // This endpoint handles ALL possible Factory payload formats (JSON, form-urlencoded, etc.)
 // and ALL possible field names (tradeNo, order_id, battery_id, device_id, sn, etc.)
 app.post('/api/webhook/factory/return', async (req, res) => {
+  // ── CROSS-STATION WEBHOOK RAW PAYLOAD LOG (very first line) ──
+  // This log is critical for debugging cross-station return matching failures.
+  // It captures the exact payload the Factory sends before any processing.
+  console.log('[CROSS-STATION WEBHOOK RAW PAYLOAD]:', JSON.stringify(req.body, null, 2));
+  console.log('[CROSS-STATION WEBHOOK QUERY PARAMS]:', JSON.stringify(req.query, null, 2));
+
   // ── BULLETPROOF LOGGING: Log EVERYTHING at the very first line ──
   // This must execute before ANY other logic so we never lose webhook data
   // even if the handler crashes downstream.
@@ -988,6 +1115,66 @@ app.post('/api/webhook/factory/return', async (req, res) => {
       }
     } catch (factoryErr) {
       console.warn(`[WEBHOOK RETURN] Factory /rent/order/query failed:`, factoryErr.message);
+    }
+  }
+
+  // ── Strategy 4: BROAD SCAN — Query Factory API for ALL active orders ──
+  // When we have a batteryId from the webhook but our stored records don't have
+  // batteryId (because Factory /rent/order/create doesn't return it), we can
+  // query the Factory API for EACH active order to find which one has the
+  // matching batteryId. This is the cross-station safety net.
+  if (!record && batteryId) {
+    console.log(`[WEBHOOK RETURN] Strategy 4: Broad scan — querying Factory API for all active orders to find batteryId=${batteryId}...`);
+    const activeOrders = [];
+    for (const [tn, rec] of rentalRecords.entries()) {
+      if (rec.status === 'active') activeOrders.push({ tradeNo: tn, record: rec });
+    }
+    console.log(`[WEBHOOK RETURN] Broad scan: ${activeOrders.length} active orders to check`);
+
+    for (const { tradeNo: tn, record: rec } of activeOrders) {
+      try {
+        const scanRes = await factoryApi.post('/rent/order/query', null, {
+          params: { tradeNo: tn },
+        });
+        const scanData = scanRes.data?.data;
+        const scanBatteryId = scanData?.batteryId || scanData?.battery_id || scanData?.batterySn || scanData?.battery_sn || null;
+
+        if (scanBatteryId && scanBatteryId === batteryId) {
+          // Found the matching order!
+          record = rec;
+          resolvedOrderId = tn;
+          matchStrategy = 'BROAD_SCAN_BATTERY_ID';
+
+          // Also update the stored record with the batteryId for future reference
+          rec.batteryId = scanBatteryId;
+          rentalRecords.set(tn, rec);
+
+          console.log(`[WEBHOOK RETURN] *** MATCH via broad scan! tradeNo=${tn}, batteryId=${scanBatteryId} ***`);
+          break;
+        }
+
+        // Also check if Factory says this order is already returned
+        const scanStatus = String(scanData?.status ?? '').trim();
+        if (scanStatus && scanStatus !== '1' && scanStatus !== '') {
+          console.log(`[WEBHOOK RETURN] Broad scan: tradeNo=${tn} Factory status="${scanStatus}" (returned?). Checking...`);
+          // If this order's Factory status is not "1" (active), it may be the returned one
+          // Even without batteryId match, we can settle this order
+          if (!batteryId || !scanBatteryId) {
+            // No batteryId to compare, but Factory says returned — settle this order
+            record = rec;
+            resolvedOrderId = tn;
+            matchStrategy = 'BROAD_SCAN_FACTORY_STATUS';
+            console.log(`[WEBHOOK RETURN] *** MATCH via broad scan Factory status! tradeNo=${tn}, status="${scanStatus}" ***`);
+            break;
+          }
+        }
+      } catch (scanErr) {
+        console.warn(`[WEBHOOK RETURN] Broad scan: query failed for tradeNo=${tn}:`, scanErr.message);
+      }
+    }
+
+    if (!record) {
+      console.warn(`[WEBHOOK RETURN] Broad scan completed. No match found for batteryId=${batteryId}.`);
     }
   }
 
