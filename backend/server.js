@@ -306,7 +306,7 @@ app.get('/payment/success', (req, res) => {
       <p>Veuillez retirer la batterie dans les 30 secondes.</p>
     </div>
     <p style="font-size:13px;color:#9ca3af;">Si la batterie ne sort pas, contactez le support avec l'ID: ${deviceId}</p>
-    <a href="https://powerbank-relleup5y-joe-shop.vercel.app" class="btn">Retour à la carte</a>
+    <a href="https://powerbank-app-two.vercel.app" class="btn">Retour à la carte</a>
   </div>
 </body>
 </html>
@@ -340,7 +340,7 @@ app.get('/payment/cancel', (req, res) => {
     <h1>Paiement Annulé</h1>
     <p>Vous avez annulé le paiement. Aucun montant n'a été débité.</p>
     <p style="font-size:13px;color:#9ca3af;margin-top:12px;">Station: ${deviceId}</p>
-    <a href="https://powerbank-relleup5y-joe-shop.vercel.app" class="btn">Réessayer</a>
+    <a href="https://powerbank-app-two.vercel.app" class="btn">Réessayer</a>
   </div>
 </body>
 </html>
