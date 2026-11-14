@@ -864,7 +864,7 @@ async function settleRental(orderId, record, returnDeviceId, batteryId) {
 
   // ── Step 1: Apply pricing model ──
   const PRICE_PER_HOUR = 1;
-  const FREE_MINUTES = 10;
+  const FREE_MINUTES = 5;
   const MIN_CHARGE = 1;
   const DAILY_CAP = 30;
   const DEPOSIT_AMOUNT = 3000;
