@@ -3,7 +3,11 @@ import { useSearchParams, useNavigate } from 'react-router-dom';
 import { CardElement, useStripe, useElements } from '@stripe/react-stripe-js';
 import axios from 'axios';
 
-const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:3000';
+// ── Production-safe env var (no localhost fallback in production) ──
+const API_BASE = import.meta.env.VITE_API_URL || 'https://powerbank-app-im73.onrender.com';
+
+// Axios instance with generous timeout for Render free-tier cold starts
+const api = axios.create({ baseURL: API_BASE, timeout: 60000 });
 
 export default function RentCheckout() {
   const [searchParams] = useSearchParams();
@@ -15,20 +19,40 @@ export default function RentCheckout() {
   const [loading, setLoading] = useState(false);
   const [status, setStatus] = useState('');
   const [cabinet, setCabinet] = useState(null);
+  const [fetchError, setFetchError] = useState(null);
+  const [retrying, setRetrying] = useState(false);
   const pollRef = useRef(null);
 
-  // Fetch cabinet info from backend (which calls Factory API)
-  useEffect(() => {
-    if (deviceId) {
-      axios.get(`${API_BASE}/api/cabinet/${deviceId}`)
-        .then(res => setCabinet(res.data))
-        .catch(() => setStatus('Erreur de chargement'));
+  // ── Fetch cabinet info with graceful error handling ──
+  const fetchCabinet = async () => {
+    if (!deviceId) {
+      setFetchError({ title: 'Aucun appareil', message: 'Veuillez scanner un QR code ou sélectionner une station.' });
+      return;
     }
+    setFetchError(null);
+    setRetrying(true);
+    try {
+      const res = await api.get(`/api/cabinet/${deviceId}`);
+      setCabinet(res.data);
+    } catch (err) {
+      console.error('Cabinet fetch error:', err);
+      setFetchError({
+        title: 'Serveur injoignable',
+        message: 'Le serveur peut être en cours de réveil (Render free tier ~50s). Réessayez.',
+        detail: err.code === 'ECONNABORTED' ? 'Délai dépassé (timeout 60s)' : (err.message || 'Erreur réseau'),
+      });
+    } finally {
+      setRetrying(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchCabinet();
     // Cleanup polling on unmount
     return () => { if (pollRef.current) clearInterval(pollRef.current); };
   }, [deviceId]);
 
-  // Poll rental order status
+  // ── Poll rental order status ──
   const pollOrderStatus = (tradeNo, paymentIntentId) => {
     let attempts = 0;
     const maxAttempts = 30; // 30 × 2s = 60s timeout
@@ -36,7 +60,7 @@ export default function RentCheckout() {
     pollRef.current = setInterval(async () => {
       attempts++;
       try {
-        const { data } = await axios.post(`${API_BASE}/api/rent/status`, { tradeNo });
+        const { data } = await api.post('/api/rent/status', { tradeNo });
 
         if (data.success) {
           clearInterval(pollRef.current);
@@ -48,7 +72,7 @@ export default function RentCheckout() {
           pollRef.current = null;
           // Timeout — release the Stripe hold
           if (paymentIntentId) {
-            try { await axios.post(`${API_BASE}/api/rent/cancel-hold`, { paymentIntentId }); } catch (e) { /* ignore */ }
+            try { await api.post('/api/rent/cancel-hold', { paymentIntentId }); } catch (e) { /* ignore */ }
           }
           setStatus('❌ Délai dépassé. La caution a été libérée.');
           setLoading(false);
@@ -75,11 +99,11 @@ export default function RentCheckout() {
 
     try {
       // Step 1: Stripe pre-authorization (€30 hold)
-      const { data: { clientSecret, paymentIntentId } } = await axios.post(`${API_BASE}/api/rent/preauth`);
+      const { data: { clientSecret, paymentIntentId } } = await api.post('/api/rent/preauth');
       setStatus('Paiement autorisé. Déverrouillage en cours...');
 
       // Step 2: Create rental order via Factory API
-      const ejectRes = await axios.post(`${API_BASE}/api/rent/eject`, { deviceId, paymentIntentId });
+      const ejectRes = await api.post('/api/rent/eject', { deviceId, paymentIntentId });
 
       if (ejectRes.data.success && ejectRes.data.tradeNo) {
         // Step 3: Poll factory for rental order status
@@ -89,12 +113,39 @@ export default function RentCheckout() {
         setLoading(false);
       }
     } catch (error) {
-      setStatus('❌ Échec: ' + (error.response?.data?.message || error.response?.data?.error || error.message));
+      const errMsg = error.code === 'ECONNABORTED'
+        ? 'Le serveur met trop de temps à répondre. Réessayez.'
+        : (error.response?.data?.message || error.response?.data?.error || error.message);
+      setStatus('❌ Échec: ' + errMsg);
       setLoading(false);
     }
   };
 
-  if (!cabinet) return <div className="p-10 text-center text-black">Chargement...</div>;
+  // ── Graceful error state (no white screen) ──
+  if (fetchError) {
+    return (
+      <div className="min-h-screen bg-gray-50 p-6 flex flex-col items-center justify-center pt-20">
+        <div className="bg-white p-8 rounded-2xl shadow-xl w-full max-w-md text-center">
+          <div className="text-4xl mb-4">⚠️</div>
+          <h1 className="text-xl font-bold text-red-700 mb-2">{fetchError.title}</h1>
+          <p className="text-gray-600 mb-2 text-sm">{fetchError.message}</p>
+          <p className="text-gray-400 mb-6 text-xs">{fetchError.detail}</p>
+          <button
+            onClick={fetchCabinet}
+            disabled={retrying}
+            className="w-full bg-blue-500 text-white py-3 rounded-xl font-bold disabled:opacity-50"
+          >
+            {retrying ? 'Réveil du serveur...' : 'Réessayer'}
+          </button>
+          <button onClick={() => navigate('/')} className="mt-4 text-gray-400 underline text-sm w-full text-center">
+            Retour à la carte
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (!cabinet) return <div className="min-h-screen flex items-center justify-center text-gray-500 text-lg">Chargement...</div>;
 
   const sym = cabinet.currencySymbol || '€';
 

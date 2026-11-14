@@ -4,23 +4,49 @@ import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import 'mapbox-gl/dist/mapbox-gl.css';
 
-mapboxgl.accessToken = 'pk.eyJ1IjoicWlhb3l1NTE1IiwiYSI6ImNtdXppb3hxcDBzb28yeXNqY3ZsbDM0cnUifQ.pQrYMN00KDIAzLaVrrkTlA';
-
-const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:3000';
+// ── Production-safe env vars ──
+mapboxgl.accessToken = import.meta.env.VITE_MAPBOX_TOKEN || 'pk.eyJ1IjoicWlhb3l1NTE1IiwiYSI6ImNtdXppb3hxcDBzb28yeXNqY3ZsbDM0cnUifQ.pQrYMN00KDIAzLaVrrkTlA';
+const API_BASE = import.meta.env.VITE_API_URL || 'https://powerbank-app-im73.onrender.com';
 
 export default function MapHome() {
   const mapContainer = useRef(null);
   const map = useRef(null);
-  const markersRef = useRef([]); 
+  const markersRef = useRef([]);
   const navigate = useNavigate();
-  
-  const [userLocation] = useState([4.101199421590414, 46.009548411992746]); 
+
+  const [userLocation] = useState([4.101199421590414, 46.009548411992746]);
   const [cabinets, setCabinets] = useState([]);
-  const [mode, setMode] = useState('rent'); 
+  const [mode, setMode] = useState('rent');
+  const [loadError, setLoadError] = useState(null);
+  const [retrying, setRetrying] = useState(false);
+
+  // Fetch nearby cabinets with graceful error handling
+  const fetchCabinets = async () => {
+    setLoadError(null);
+    setRetrying(true);
+    try {
+      const res = await axios.get(`${API_BASE}/api/nearby`, { timeout: 30000 });
+      if (Array.isArray(res.data)) {
+        setCabinets(res.data);
+      } else {
+        setCabinets([]);
+      }
+    } catch (err) {
+      console.error('Map data error:', err);
+      setLoadError({
+        title: 'Serveur injoignable',
+        message: 'Le serveur peut être en cours de réveil (Render free tier). Réessayez dans quelques secondes.',
+        detail: err.code === 'ECONNABORTED' ? 'Délai dépassé (timeout)' : (err.message || 'Erreur réseau'),
+      });
+      setCabinets([]);
+    } finally {
+      setRetrying(false);
+    }
+  };
 
   useEffect(() => {
     if (map.current) return;
-    
+
     map.current = new mapboxgl.Map({
       container: mapContainer.current,
       style: 'mapbox://styles/mapbox/streets-v12',
@@ -38,11 +64,7 @@ export default function MapHome() {
       'bottom-right'
     );
 
-    axios.get(`${API_BASE}/api/nearby`)
-      .then((res) => {
-        if (Array.isArray(res.data)) setCabinets(res.data);
-      })
-      .catch(err => console.error("Map data error:", err));
+    fetchCabinets();
   }, [userLocation]);
 
   useEffect(() => {
@@ -97,7 +119,37 @@ export default function MapHome() {
 
   return (
     <div style={{ position: 'relative', width: '100vw', height: '100vh', backgroundColor: '#e5e7eb' }}>
-      
+
+      {/* ── Graceful error banner (no white screen) ── */}
+      {loadError && (
+        <div style={{
+          position: 'absolute', top: 0, left: 0, right: 0, zIndex: 100,
+          background: '#fef2f2', borderBottom: '2px solid #ef4444',
+          padding: '16px 20px', textAlign: 'center', fontFamily: 'system-ui, sans-serif',
+        }}>
+          <p style={{ fontSize: '16px', fontWeight: 'bold', color: '#991b1b', marginBottom: '4px' }}>
+            {loadError.title}
+          </p>
+          <p style={{ fontSize: '13px', color: '#7f1d1d', marginBottom: '8px' }}>
+            {loadError.message}
+          </p>
+          <p style={{ fontSize: '12px', color: '#9ca3af', marginBottom: '8px' }}>
+            {loadError.detail}
+          </p>
+          <button
+            onClick={fetchCabinets}
+            disabled={retrying}
+            style={{
+              background: retrying ? '#9ca3af' : '#ef4444', color: 'white',
+              border: 'none', padding: '8px 20px', borderRadius: '8px',
+              fontWeight: 'bold', cursor: retrying ? 'default' : 'pointer', fontSize: '14px',
+            }}
+          >
+            {retrying ? 'Réveil du serveur...' : 'Réessayer'}
+          </button>
+        </div>
+      )}
+
       <div style={{ position: 'absolute', top: '30px', left: '50%', transform: 'translateX(-50%)', zIndex: 10, display: 'flex', gap: '5px', backgroundColor: 'white', padding: '6px', borderRadius: '30px', boxShadow: '0 10px 15px -3px rgba(0,0,0,0.1)' }}>
         <button 
           onClick={() => setMode('rent')}

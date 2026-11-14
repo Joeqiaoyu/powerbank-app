@@ -5,16 +5,33 @@ const Stripe = require('stripe');
 const axios = require('axios');
 
 const app = express();
-app.use(cors());
+
+// ── Production-grade CORS ──
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+}));
 app.use(express.json());
 
-const stripe = Stripe(process.env.STRIPE_SECRET_KEY || 'sk_test_mock');
+// ── Environment variable safety checks ──
+const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
+const FACTORY_API_BASE_URL = process.env.FACTORY_API_BASE_URL;
+const FACTORY_USERNAME = process.env.FACTORY_USERNAME;
+const FACTORY_PASSWORD = process.env.FACTORY_PASSWORD;
+
+if (!STRIPE_SECRET_KEY) {
+  console.warn('⚠️  WARNING: STRIPE_SECRET_KEY is not set. Stripe payments will fail.');
+}
+if (!FACTORY_USERNAME || !FACTORY_PASSWORD) {
+  console.warn('⚠️  WARNING: FACTORY_USERNAME or FACTORY_PASSWORD is not set. Factory API calls will fail.');
+}
+
+const stripe = STRIPE_SECRET_KEY ? Stripe(STRIPE_SECRET_KEY) : null;
 
 // ── Factory API (Bajie Charging / ChargeNow) ──────────────────────────
-const FACTORY_BASE_URL = process.env.FACTORY_API_BASE_URL || 'https://developer.chargenow.top/cdb-open-api/v1';
-const FACTORY_USERNAME = process.env.FACTORY_USERNAME || 'Joe';
-const FACTORY_PASSWORD = process.env.FACTORY_PASSWORD || 'Joe@2026';
-const CALLBACK_URL = process.env.CALLBACK_URL || 'http://localhost:3000/api/rent/callback';
+const FACTORY_BASE_URL = FACTORY_API_BASE_URL || 'https://developer.chargenow.top/cdb-open-api/v1';
+const CALLBACK_URL = process.env.CALLBACK_URL || 'https://powerbank-app-im73.onrender.com/api/rent/callback';
 
 // Axios instance with Basic Auth
 const factoryApi = axios.create({
@@ -56,6 +73,16 @@ const MOCK_CABINET = {
   isOnline: true,
   address: '24 Rue des Guérins, 42120 Le Coteau, 法国',
 };
+
+// ── 0. GET /health — Health check (critical for Render free-tier wake detection)
+app.get('/health', (req, res) => {
+  res.status(200).json({
+    status: 'UP',
+    timestamp: new Date().toISOString(),
+    stripe: !!stripe,
+    factory: !!(FACTORY_USERNAME && FACTORY_PASSWORD),
+  });
+});
 
 // ── 1. GET /api/nearby — List Nearby Rentable Shops (Factory: POST /rent/cabinet/list)
 app.get('/api/nearby', async (req, res) => {
@@ -199,6 +226,7 @@ app.get('/pay/:deviceId', async (req, res) => {
 
 // ── 3. POST /api/rent/preauth — Stripe Pre-authorization (€30 Hold)
 app.post('/api/rent/preauth', async (req, res) => {
+  if (!stripe) return res.status(500).json({ error: 'Stripe is not configured (STRIPE_SECRET_KEY missing).' });
   try {
     const paymentIntent = await stripe.paymentIntents.create({
       amount: 3000,
@@ -215,6 +243,7 @@ app.post('/api/rent/preauth', async (req, res) => {
 // ── 3b. GET /api/rent/checkout-link — Stripe Checkout Session (no registration, direct payment)
 app.get('/api/rent/checkout-link', async (req, res) => {
   const deviceId = req.query.deviceId || 'DTA55642';
+  if (!stripe) return res.status(500).json({ error: 'Stripe is not configured (STRIPE_SECRET_KEY missing).' });
   const host = req.get('host') || 'powerbank-app-im73.onrender.com';
   const proto = req.get('x-forwarded-proto') || req.protocol || 'https';
   const baseUrl = `${proto}://${host}`;
