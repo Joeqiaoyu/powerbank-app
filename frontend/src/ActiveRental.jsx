@@ -75,18 +75,16 @@ export default function ActiveRental() {
           const elapsed = Math.floor((Date.now() - ms) / 1000);
           setElapsedSeconds(elapsed > 0 ? elapsed : 0);
         }
-      } else if (data.success && !data.status) {
-        // Legacy fallback: Factory API returned success but no explicit status
-        // Treat as active if we have a startTime
-        if (data.startTime) {
-          setRentalStatus('active');
-          const ms = new Date(data.startTime).getTime();
-          setStartTimeMs(ms);
-          const elapsed = Math.floor((Date.now() - ms) / 1000);
-          setElapsedSeconds(elapsed > 0 ? elapsed : 0);
-        } else {
-          setRentalStatus('active');
-        }
+      } else if (data.status === 'unknown' || (data.success && !data.status)) {
+        // Factory says order exists but status is unknown — treat as active
+        // This happens when Render restarts and local record is lost
+        // The backend fallback will detect return on next poll
+        setRentalStatus('active');
+        // No startTime available — use current time as approximation
+        const now = Date.now();
+        setStartTimeMs(now);
+        setElapsedSeconds(0);
+        console.log('[INITIAL FETCH] Status unknown — treating as active with current time as start');
       } else {
         setErrorMessage(data.message || 'Commande introuvable.');
         setRentalStatus('error');
