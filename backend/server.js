@@ -245,12 +245,10 @@ app.get('/api/rent/checkout-link', async (req, res) => {
   const deviceId = req.query.deviceId || 'DTA55642';
   if (!stripe) return res.status(500).json({ error: 'Stripe is not configured (STRIPE_SECRET_KEY missing).' });
 
-  // ── Frontend URL for success/cancel redirects ──
-  // Use FRONTEND_URL env var, or infer from the Referer/Origin header, or fall back to the Vercel deployment
-  const frontendUrl = process.env.FRONTEND_URL
-    || (req.headers.origin ? req.headers.origin.replace(/\/$/, '') : null)
-    || (req.headers.referer ? new URL(req.headers.referer).origin : null)
-    || 'https://powerbank-app-two.vercel.app';
+  // ── CRITICAL: success_url must ALWAYS point to the FRONTEND (Vercel), never the backend ──
+  // Do NOT use req.headers.origin — when called from /pay/:deviceId (backend page),
+  // the Origin header is the backend's own URL, which causes "Cannot GET /rent/success"
+  const frontendUrl = (process.env.FRONTEND_URL || 'https://powerbank-app-two.vercel.app').replace(/\/$/, '');
 
   try {
     const session = await stripe.checkout.sessions.create({
@@ -266,7 +264,7 @@ app.get('/api/rent/checkout-link', async (req, res) => {
         quantity: 1,
       }],
       mode: 'payment',
-      // ── Redirect to the FRONTEND success page, which will trigger /api/rent/eject ──
+      // ── ALWAYS redirect to the FRONTEND success page ──
       success_url: `${frontendUrl}/rent/success?deviceId=${deviceId}&session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${frontendUrl}/?paid=cancel`,
       metadata: { deviceId },
