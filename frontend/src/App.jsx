@@ -6,6 +6,7 @@ import RentCheckout from './RentCheckout';
 import RentSuccess from './RentSuccess';
 import ActiveRental from './ActiveRental';
 import RentSummary from './RentSummary';
+import AdminQRCodes from './AdminQRCodes';
 import 'mapbox-gl/dist/mapbox-gl.css';
 
 // Stripe Public Key
@@ -21,6 +22,7 @@ export default function App() {
           <Route path="/rent/success" element={<RentSuccess />} />
           <Route path="/rent/active" element={<ActiveRental />} />
           <Route path="/rent/summary" element={<RentSummary />} />
+          <Route path="/admin/qrcodes" element={<AdminQRCodes />} />
         </Routes>
       </Router>
     </Elements>
