@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect } from 'react';
 import { useSearchParams, useNavigate } from 'react-router-dom';
 import { CardElement, useStripe, useElements } from '@stripe/react-stripe-js';
 import axios from 'axios';
@@ -21,7 +21,6 @@ export default function RentCheckout() {
   const [cabinet, setCabinet] = useState(null);
   const [fetchError, setFetchError] = useState(null);
   const [retrying, setRetrying] = useState(false);
-  const pollRef = useRef(null);
 
   // ── Fetch cabinet info with graceful error handling ──
   const fetchCabinet = async () => {
@@ -48,48 +47,7 @@ export default function RentCheckout() {
 
   useEffect(() => {
     fetchCabinet();
-    // Cleanup polling on unmount
-    return () => { if (pollRef.current) clearInterval(pollRef.current); };
   }, [deviceId]);
-
-  // ── Poll rental order status ──
-  const pollOrderStatus = (tradeNo, paymentIntentId) => {
-    let attempts = 0;
-    const maxAttempts = 30; // 30 × 2s = 60s timeout
-
-    pollRef.current = setInterval(async () => {
-      attempts++;
-      try {
-        const { data } = await api.post('/api/rent/status', { tradeNo });
-
-        if (data.success) {
-          clearInterval(pollRef.current);
-          pollRef.current = null;
-          setStatus('✅ Batterie déverrouillée ! Retirez-la maintenant.');
-          setLoading(false);
-        } else if (attempts >= maxAttempts) {
-          clearInterval(pollRef.current);
-          pollRef.current = null;
-          // Timeout — release the Stripe hold
-          if (paymentIntentId) {
-            try { await api.post('/api/rent/cancel-hold', { paymentIntentId }); } catch (e) { /* ignore */ }
-          }
-          setStatus('❌ Délai dépassé. La caution a été libérée.');
-          setLoading(false);
-        } else {
-          setStatus(`⏳ Déverrouillage en cours... (${attempts}/${maxAttempts})`);
-        }
-      } catch (err) {
-        // Keep polling on transient errors
-        if (attempts >= maxAttempts) {
-          clearInterval(pollRef.current);
-          pollRef.current = null;
-          setStatus('❌ Erreur de vérification du statut.');
-          setLoading(false);
-        }
-      }
-    }, 2000);
-  };
 
   const handleRent = async (e) => {
     e.preventDefault();
@@ -102,7 +60,6 @@ export default function RentCheckout() {
       const { data: { clientSecret, paymentIntentId } } = await api.post('/api/rent/preauth');
 
       // Step 2: Confirm the card payment with Stripe
-      // return_url uses the CURRENT domain dynamically — never hardcoded
       const { error: confirmError, paymentIntent: confirmedPI } = await stripe.confirmCardPayment(clientSecret, {
         payment_method: { card: elements.getElement(CardElement) },
         return_url: `${window.location.origin}/rent/success?deviceId=${deviceId}`,
@@ -115,9 +72,7 @@ export default function RentCheckout() {
       }
 
       // If the payment requires a redirect (3DS), Stripe handles it.
-      // If it succeeds immediately, we proceed to eject.
       if (confirmedPI.status === 'requires_action' || confirmedPI.status === 'requires_redirect') {
-        // Stripe will redirect the user — no further action needed here
         setStatus('Redirection vers votre banque pour validation...');
         return;
       }
@@ -127,8 +82,9 @@ export default function RentCheckout() {
       const ejectRes = await api.post('/api/rent/eject', { deviceId, paymentIntentId: confirmedPI.id });
 
       if (ejectRes.data.success && ejectRes.data.tradeNo) {
-        // Step 4: Poll factory for rental order status
-        pollOrderStatus(ejectRes.data.tradeNo, confirmedPI.id);
+        // Step 4: Redirect to the active rental page with live timer
+        const orderId = ejectRes.data.tradeNo;
+        navigate(`/rent/active?orderId=${orderId}&deviceId=${deviceId}`);
       } else {
         setStatus('❌ Échec: ' + (ejectRes.data.message || 'Erreur inconnue'));
         setLoading(false);

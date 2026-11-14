@@ -4,6 +4,7 @@ import { Elements } from '@stripe/react-stripe-js';
 import MapHome from './MapHome';
 import RentCheckout from './RentCheckout';
 import RentSuccess from './RentSuccess';
+import ActiveRental from './ActiveRental';
 import RentSummary from './RentSummary';
 import 'mapbox-gl/dist/mapbox-gl.css';
 
@@ -18,6 +19,7 @@ export default function App() {
           <Route path="/" element={<MapHome />} />
           <Route path="/rent" element={<RentCheckout />} />
           <Route path="/rent/success" element={<RentSuccess />} />
+          <Route path="/rent/active" element={<ActiveRental />} />
           <Route path="/rent/summary" element={<RentSummary />} />
         </Routes>
       </Router>

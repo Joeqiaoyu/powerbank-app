@@ -782,14 +782,11 @@ app.get('/api/rent/status/:orderId', async (req, res) => {
         console.log(`[STATUS POLL] Factory query response:`, JSON.stringify(factoryRes.data, null, 2));
 
         // Check if Factory indicates the battery was returned
-        // Factory callback data may contain return info
         const callbackData = rentalResults.get(orderId);
         if (callbackData) {
           console.log(`[STATUS POLL] Found callback data:`, JSON.stringify(callbackData));
-          // If callback indicates return, trigger settlement
           if (callbackData.status === 'returned' || callbackData.returnTime) {
-            console.log(`[STATUS POLL] Battery returned detected via callback. Triggering settlement...`);
-            // Settlement is handled by webhook, but as fallback we process it here
+            console.log(`[STATUS POLL] Battery returned detected via callback. Settlement should be handled by webhook.`);
           }
         }
       } catch (err) {
@@ -797,14 +794,44 @@ app.get('/api/rent/status/:orderId', async (req, res) => {
       }
     }
 
+    // ── Build response with top-level totalDuration and finalCost for frontend ──
+    const billing = record.billing;
+    const startTimeMs = new Date(record.startTime).getTime();
+    const nowMs = Date.now();
+    const endTimeMs = record.endTime ? new Date(record.endTime).getTime() : nowMs;
+
+    // For active rentals, duration is live; for completed, it's frozen at settlement time
+    const totalDurationMs = record.status === 'completed' ? (endTimeMs - startTimeMs) : (nowMs - startTimeMs);
+    const totalDurationSeconds = Math.floor(totalDurationMs / 1000);
+    const totalDurationMinutes = Math.floor(totalDurationSeconds / 60);
+    const durationHours = Math.floor(totalDurationMinutes / 60);
+    const remainingMinutes = totalDurationMinutes % 60;
+    const remainingSeconds = totalDurationSeconds % 60;
+
+    const durationDisplay = record.status === 'completed' && billing
+      ? billing.durationDisplay
+      : `${String(durationHours).padStart(2, '0')}:${String(remainingMinutes).padStart(2, '0')}:${String(remainingSeconds).padStart(2, '0')}`;
+
+    const finalCost = billing ? billing.chargeAmountEur : 0;
+
     return res.json({
       success: true,
+      orderId,
       tradeNo: record.tradeNo,
       deviceId: record.deviceId,
       status: record.status,                 // 'active' | 'completed' | 'failed'
       startTime: record.startTime,
       endTime: record.endTime,
-      billing: record.billing,               // null when active, populated when completed
+      // ── Top-level fields for frontend polling ──
+      totalDuration: durationDisplay,
+      totalDurationMs,
+      totalDurationSeconds,
+      finalCost,
+      finalCostDisplay: `${finalCost.toFixed(2).replace('.', ',')} \u20ac`,
+      // ── Full billing breakdown (available when completed) ──
+      billing: billing,
+      depositReleased: billing ? billing.releasedAmountEur : 0,
+      depositReleasedDisplay: billing ? `${billing.releasedAmountEur.toFixed(2).replace('.', ',')} \u20ac` : null,
       callbackResult: rentalResults.get(orderId) || null,
     });
   }
