@@ -997,6 +997,13 @@ app.post('/api/webhook/factory/return', async (req, res) => {
 // ── 7c. GET /api/rent/status/:orderId — Full status endpoint for frontend polling
 // Returns rental status including billing info when completed.
 // Supports both tradeNo (Factory order) and session-based lookups.
+//
+// CRITICAL DESIGN: This endpoint does NOT rely on Factory webhooks for return detection.
+// It actively queries the Factory API /rent/order/query on EVERY poll to check if the
+// battery has been returned. This is the most reliable approach because:
+// 1. Factory webhooks may not be sent (or sent to wrong URL, or lost during Render sleep)
+// 2. Factory may send form-urlencoded payloads we can't predict
+// 3. The Factory's /rent/order/query returns the current order status directly
 app.get('/api/rent/status/:orderId', async (req, res) => {
   const orderId = req.params.orderId;
   console.log(`[STATUS POLL] Querying status for orderId=${orderId}`);
@@ -1005,40 +1012,109 @@ app.get('/api/rent/status/:orderId', async (req, res) => {
   const record = rentalRecords.get(orderId);
 
   if (record) {
-    console.log(`[STATUS POLL] Found record: status=${record.status}, hasBilling=${!!record.billing}`);
+    console.log(`[STATUS POLL] Found local record: status=${record.status}, hasBilling=${!!record.billing}`);
 
-    // If still active, also query Factory API for latest status
+    // If still active, query Factory API for latest status EVERY TIME
+    // This is the primary return detection mechanism — NOT webhooks.
     if (record.status === 'active') {
       try {
         const factoryRes = await factoryApi.post('/rent/order/query', null, {
           params: { tradeNo: orderId },
         });
-        console.log(`[STATUS POLL] Factory query response:`, JSON.stringify(factoryRes.data, null, 2));
 
-        // ── Check if Factory indicates the battery was returned ──
-        // Factory's order/query may return status, returnTime, endTime, or similar fields
+        // ── Log FULL Factory response for debugging ──
+        console.log(`[STATUS POLL] Factory /rent/order/query FULL response:`, JSON.stringify(factoryRes.data, null, 2));
+
         const factoryData = factoryRes.data?.data;
-        const callbackData = rentalResults.get(orderId);
+        const factoryCode = factoryRes.data?.code;
+        const factoryMsg = factoryRes.data?.msg;
 
+        // ── Check callback data too ──
+        const callbackData = rentalResults.get(orderId);
         if (callbackData) {
-          console.log(`[STATUS POLL] Found callback data:`, JSON.stringify(callbackData));
+          console.log(`[STATUS POLL] Callback data stored:`, JSON.stringify(callbackData));
         }
 
-        // ── SAFETY FALLBACK: If Factory says battery returned but webhook hasn't fired yet,
-        // trigger settlement inline so the frontend timer stops. ──
-        if (factoryData) {
-          const factoryOrderStatus = String(factoryData.status || factoryData.orderStatus || factoryData.state || '').toLowerCase();
-          const hasReturnTime = factoryData.returnTime || factoryData.endTime || factoryData.return_time || factoryData.end_time;
-          const returnKeywords = ['return', 'returned', 'end', 'ended', 'finish', 'finished', 'complete', 'completed', 'close', 'closed'];
-          const factorySaysReturned = returnKeywords.some(kw => factoryOrderStatus.includes(kw)) || hasReturnTime;
+        // ── RETURN DETECTION LOGIC ──
+        // The Factory uses numeric status codes in /rent/order/query response.
+        // We check multiple possible indicators that the battery was returned.
+        //
+        // Factory callbackResult shows: {"status":"1", "tradeNo":"..."} 
+        // status "1" = active/rented. Other statuses likely indicate return.
+        //
+        // We also check the Factory's order/query response data for return indicators.
+        let factorySaysReturned = false;
+        let returnReason = '';
 
-          if (factorySaysReturned) {
-            console.log(`[STATUS POLL] *** FACTORY indicates battery RETURNED for tradeNo=${orderId}. Triggering inline settlement as safety fallback... ***`);
-            const returnDeviceId = factoryData.returnDeviceId || factoryData.return_device_id || factoryData.cabinetId || factoryData.device_id || record.deviceId;
-            const batteryId = factoryData.batteryId || factoryData.battery_id || factoryData.batterySn || record.batteryId || null;
-            await settleRental(orderId, record, returnDeviceId, batteryId);
-            console.log(`[STATUS POLL] Inline settlement completed. Record is now completed.`);
+        if (factoryData) {
+          // ── Check 1: Numeric/string status codes ──
+          // Factory may use: 0=completed/returned, 2=returned, 3=ended, etc.
+          // If status is NOT "1" (active), it likely means returned.
+          const fStatus = String(factoryData.status ?? factoryData.orderStatus ?? factoryData.state ?? factoryData.order_status ?? '').trim();
+          if (fStatus && fStatus !== '1' && fStatus !== '') {
+            // Any status that's not "1" (active) is likely a return/end state
+            factorySaysReturned = true;
+            returnReason = `Factory status="${fStatus}" (not "1"=active)`;
           }
+
+          // ── Check 2: English keywords (backup) ──
+          if (!factorySaysReturned) {
+            const returnKeywords = ['return', 'returned', 'end', 'ended', 'finish', 'finished', 'complete', 'completed', 'close', 'closed'];
+            if (returnKeywords.some(kw => fStatus.toLowerCase().includes(kw))) {
+              factorySaysReturned = true;
+              returnReason = `Factory status contains return keyword: "${fStatus}"`;
+            }
+          }
+
+          // ── Check 3: Return time fields ──
+          if (!factorySaysReturned) {
+            const hasReturnTime = factoryData.returnTime || factoryData.endTime || factoryData.return_time || factoryData.end_time || factoryData.closeTime || factoryData.close_time;
+            if (hasReturnTime) {
+              factorySaysReturned = true;
+              returnReason = `Factory has returnTime/endTime: ${JSON.stringify(hasReturnTime)}`;
+            }
+          }
+
+          // ── Check 4: Battery position indicates returned ──
+          // If the battery is back in a slot, the order is done
+          if (!factorySaysReturned && factoryData.batteryStatus) {
+            const bStatus = String(factoryData.batteryStatus).toLowerCase();
+            if (bStatus.includes('return') || bStatus.includes('slot') || bStatus.includes('in')) {
+              factorySaysReturned = true;
+              returnReason = `Factory batteryStatus="${factoryData.batteryStatus}"`;
+            }
+          }
+        }
+
+        // ── Check 5: Callback status changed from "1" to something else ──
+        if (!factorySaysReturned && callbackData) {
+          const cbStatus = String(callbackData.status ?? '').trim();
+          if (cbStatus && cbStatus !== '1' && cbStatus !== '') {
+            factorySaysReturned = true;
+            returnReason = `Callback status="${cbStatus}" (not "1"=active)`;
+          }
+        }
+
+        // ── Check 6: Factory code indicates order not found / expired (non-zero and not success) ──
+        // If the order query returns a non-zero code, the order may have been closed
+        if (!factorySaysReturned && factoryCode !== undefined && factoryCode !== 0) {
+          // Code 0 = success/active. Non-zero might mean the order is closed/returned/expired
+          // But we need to be careful — some non-zero codes mean "query failed", not "returned"
+          // Only treat as returned if the code suggests the order is done
+          if (factoryCode === 2004 || factoryCode === 2005 || factoryCode === 2006) {
+            factorySaysReturned = true;
+            returnReason = `Factory code=${factoryCode} (order closed/not found)`;
+          }
+        }
+
+        if (factorySaysReturned) {
+          console.log(`[STATUS POLL] *** RETURN DETECTED! Reason: ${returnReason}. Triggering settlement... ***`);
+          const returnDeviceId = factoryData?.returnDeviceId || factoryData?.return_device_id || factoryData?.cabinetId || factoryData?.device_id || record.deviceId;
+          const batteryId = factoryData?.batteryId || factoryData?.battery_id || factoryData?.batterySn || record.batteryId || null;
+          await settleRental(orderId, record, returnDeviceId, batteryId);
+          console.log(`[STATUS POLL] Settlement complete. Record status is now: ${record.status}`);
+        } else {
+          console.log(`[STATUS POLL] Battery still active (factory status="${factoryData?.status ?? 'N/A'}", code=${factoryCode})`);
         }
       } catch (err) {
         console.warn(`[STATUS POLL] Factory query failed (non-fatal):`, err.message);
@@ -1094,13 +1170,19 @@ app.get('/api/rent/status/:orderId', async (req, res) => {
       params: { tradeNo: orderId },
     });
 
-    console.log(`[STATUS POLL] Factory response:`, JSON.stringify(response.data, null, 2));
+    console.log(`[STATUS POLL] Factory fallback response:`, JSON.stringify(response.data, null, 2));
+
+    // ── Even without a local record, try to determine status from Factory response ──
+    const factoryData = response.data?.data;
+    const factoryStatus = String(factoryData?.status ?? '').trim();
+    const isActive = factoryStatus === '1' || response.data.code === 0;
 
     return res.json({
       success: response.data.code === 0,
       tradeNo: orderId,
-      status: response.data.code === 0 ? 'active' : 'unknown',
+      status: isActive ? 'active' : 'unknown',
       message: response.data.msg,
+      factoryStatus,
       callbackResult: rentalResults.get(orderId) || null,
     });
   } catch (error) {

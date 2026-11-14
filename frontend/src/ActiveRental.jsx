@@ -64,7 +64,7 @@ export default function ActiveRental() {
         return;
       }
 
-      if (data.status === 'active' || data.success) {
+      if (data.status === 'active') {
         setRentalStatus('active');
 
         // Parse startTime from backend ISO string
@@ -74,6 +74,18 @@ export default function ActiveRental() {
           // Immediately calculate elapsed
           const elapsed = Math.floor((Date.now() - ms) / 1000);
           setElapsedSeconds(elapsed > 0 ? elapsed : 0);
+        }
+      } else if (data.success && !data.status) {
+        // Legacy fallback: Factory API returned success but no explicit status
+        // Treat as active if we have a startTime
+        if (data.startTime) {
+          setRentalStatus('active');
+          const ms = new Date(data.startTime).getTime();
+          setStartTimeMs(ms);
+          const elapsed = Math.floor((Date.now() - ms) / 1000);
+          setElapsedSeconds(elapsed > 0 ? elapsed : 0);
+        } else {
+          setRentalStatus('active');
         }
       } else {
         setErrorMessage(data.message || 'Commande introuvable.');
@@ -181,7 +193,7 @@ export default function ActiveRental() {
         // Do NOT change rentalStatus on poll error — keep timer running.
         // The backend may be cold-starting (Render free tier). Next poll may succeed.
       }
-    }, 5000);
+    }, 3000); // Poll every 3 seconds for faster return detection
 
     return () => {
       if (pollRef.current) {
@@ -246,8 +258,15 @@ export default function ActiveRental() {
               <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
             </svg>
           </div>
-          <h1 className="text-2xl font-bold text-green-700 mb-2">Batterie retournee !</h1>
-          <p className="text-gray-500 text-sm">Redirection vers le recapitulatif...</p>
+          <h1 className="text-2xl font-bold text-green-700 mb-2">✅ Batterie retournée !</h1>
+          <p className="text-gray-600 text-sm mb-4">Redirection vers le récapitulatif...</p>
+          {finalCost !== null && (
+            <div className="bg-green-50 rounded-2xl p-4 mb-2">
+              <p className="text-green-700 text-sm font-bold">
+                Montant prélevé : {finalCost.toFixed(2).replace('.', ',')} €
+              </p>
+            </div>
+          )}
         </div>
       </div>
     );
