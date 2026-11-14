@@ -478,6 +478,8 @@ app.post('/api/rent/eject', async (req, res) => {
     // ── Log full factory response ──
     console.log('[FACTORY API] Response status:', response.status);
     console.log('[FACTORY API] Response data:', JSON.stringify(response.data, null, 2));
+    console.log('[FACTORY API] response.data.data (full):', JSON.stringify(response.data.data, null, 2));
+    console.log('[FACTORY API] response.data.data keys:', response.data.data ? Object.keys(response.data.data) : 'NO DATA');
 
     if (response.data.code !== 0) {
       // Factory rejected the order — instantly release the Stripe hold
@@ -495,15 +497,39 @@ app.post('/api/rent/eject', async (req, res) => {
     // ── Extract batteryId from Factory response if available ──
     // Factory's /rent/order/create may return batteryId/batterySn in response.data.data
     // This is CRITICAL for reverse lookup in the webhook when Factory doesn't send our tradeNo.
-    const batteryId = response.data.data?.batteryId || response.data.data?.battery_id || response.data.data?.batterySn || response.data.data?.battery_sn || null;
-    console.log('[FACTORY API] Success! TradeNo:', tradeNo, 'BatteryId:', batteryId || 'NOT PROVIDED');
+    // We check ALL possible field names the Factory might use.
+    const factoryDataObj = response.data.data || {};
+    const batteryId = factoryDataObj.batteryId
+      || factoryDataObj.battery_id
+      || factoryDataObj.batterySn
+      || factoryDataObj.battery_sn
+      || factoryDataObj.powerBankId
+      || factoryDataObj.power_bank_id
+      || factoryDataObj.bid
+      || null;
+
+    // ── Also extract any additional identifiers Factory may provide ──
+    const factoryOrderId = factoryDataObj.orderId || factoryDataObj.order_id || factoryDataObj.sn || null;
+    const factoryDeviceId = factoryDataObj.deviceId || factoryDataObj.device_id || factoryDataObj.cabinetId || factoryDataObj.cabinet_id || deviceId;
+
+    console.log('[FACTORY API] Success! TradeNo:', tradeNo);
+    console.log('[FACTORY API] Extracted batteryId:', batteryId || 'NOT PROVIDED BY FACTORY');
+    console.log('[FACTORY API] Extracted factoryOrderId:', factoryOrderId || 'N/A');
+    console.log('[FACTORY API] Extracted factoryDeviceId:', factoryDeviceId || 'N/A');
+
+    if (!batteryId) {
+      console.warn('[FACTORY API] ⚠️ No batteryId in Factory response! Webhook reverse lookup by batteryId will NOT work for this order.');
+      console.warn('[FACTORY API] Full response.data.data for debugging:', JSON.stringify(factoryDataObj, null, 2));
+    }
 
     // ── Store rental record for settlement lifecycle ──
     const startTime = new Date();
     rentalRecords.set(tradeNo, {
       tradeNo,
-      deviceId,
-      batteryId,                           // ← Store for webhook reverse lookup
+      orderId: tradeNo,                   // alias for debugging clarity
+      deviceId,                            // dispensing station
+      batteryId,                           // ← CRITICAL for webhook reverse lookup
+      factoryOrderId,                     // Factory's own order ID (if different from tradeNo)
       paymentIntentId: paymentIntentId || null,
       startTime: startTime.toISOString(),
       endTime: null,
@@ -511,7 +537,8 @@ app.post('/api/rent/eject', async (req, res) => {
       billing: null,            // populated on return/settlement
       createdAt: startTime.toISOString(),
     });
-    console.log(`[RENTAL RECORD] Created for tradeNo=${tradeNo}, deviceId=${deviceId}, batteryId=${batteryId || 'N/A'}, startTime=${startTime.toISOString()}, paymentIntentId=${paymentIntentId || 'NONE'}`);
+    console.log(`[RENTAL RECORD] Created: tradeNo=${tradeNo}, deviceId=${deviceId}, batteryId=${batteryId || 'N/A'}, paymentIntentId=${paymentIntentId || 'NONE'}`);
+    console.log(`[RENTAL RECORD] Full record:`, JSON.stringify(rentalRecords.get(tradeNo), null, 2));
 
     res.json({
       success: true,
@@ -826,9 +853,9 @@ app.post('/api/webhook/factory/return', async (req, res) => {
   console.log('═══════════════════════════════════════════════════════════════');
   console.log('[WEBHOOK RECEIVED] Timestamp:', new Date().toISOString());
   console.log('[WEBHOOK RECEIVED] Method:', req.method, 'URL:', req.originalUrl);
-  console.log('[WEBHOOK RECEIVED] Query params:', JSON.stringify(req.query, null, 2));
+  console.log('[WEBHOOK PAYLOAD]:', JSON.stringify(req.body, null, 2));
+  console.log('[WEBHOOK QUERY]:', JSON.stringify(req.query, null, 2));
   console.log('[WEBHOOK RECEIVED] Headers:', JSON.stringify(req.headers, null, 2));
-  console.log('[WEBHOOK RECEIVED] Body (raw):', JSON.stringify(req.body, null, 2));
   console.log('[WEBHOOK RECEIVED] Content-Type:', req.headers['content-type']);
   console.log('[WEBHOOK RECEIVED] Body type:', typeof req.body);
   console.log('[WEBHOOK RECEIVED] Body keys:', req.body ? Object.keys(req.body) : 'NO BODY');
@@ -967,15 +994,17 @@ app.post('/api/webhook/factory/return', async (req, res) => {
   // ── If no record found at all, respond success (Factory won't retry) ──
   if (!record) {
     console.warn(`[WEBHOOK RETURN] ❌ NO MATCH FOUND. Tried: ${matchStrategy}. Tried orderId=${orderId}, batteryId=${batteryId}. Responding success to prevent Factory retries.`);
+    console.log('[MATCHED ORDER]: Not Found');
     // Log all active rental records for debugging
     const activeRecords = [];
     for (const [tn, rec] of rentalRecords.entries()) {
-      if (rec.status === 'active') activeRecords.push({ tradeNo: tn, deviceId: rec.deviceId, batteryId: rec.batteryId || 'N/A' });
+      if (rec.status === 'active') activeRecords.push({ tradeNo: tn, orderId: rec.orderId, deviceId: rec.deviceId, batteryId: rec.batteryId || 'N/A', factoryOrderId: rec.factoryOrderId || 'N/A' });
     }
     console.log(`[WEBHOOK RETURN] Active rental records in memory (${activeRecords.length}):`, JSON.stringify(activeRecords, null, 2));
     return res.json({ code: 0, msg: 'success' });
   }
 
+  console.log(`[MATCHED ORDER]: Found (strategy: ${matchStrategy}, orderId: ${resolvedOrderId})`);
   console.log(`[WEBHOOK RETURN] Match strategy: ${matchStrategy}. Resolved orderId: ${resolvedOrderId}`);
 
   // ── If already completed, ignore duplicate ──
@@ -1339,6 +1368,150 @@ app.post('/api/rent/cancel-hold', async (req, res) => {
     res.json({ success: true, message: 'Caution libérée' });
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+// ── 9. GET /api/debug/orders — Debug endpoint: dump all in-memory rental records
+// Returns ALL rental records (both active and completed) with full identifier details.
+// Use this to inspect exactly what identifiers (deviceId, batteryId, orderId) are being
+// saved when a rental starts, and to diagnose webhook matching failures.
+app.get('/api/debug/orders', (req, res) => {
+  const records = [];
+  const activeCount = { active: 0, completed: 0, failed: 0, other: 0 };
+
+  for (const [tradeNo, rec] of rentalRecords.entries()) {
+    records.push({
+      tradeNo,
+      orderId: rec.orderId || tradeNo,
+      deviceId: rec.deviceId || null,
+      batteryId: rec.batteryId || null,
+      factoryOrderId: rec.factoryOrderId || null,
+      paymentIntentId: rec.paymentIntentId || null,
+      startTime: rec.startTime || null,
+      endTime: rec.endTime || null,
+      status: rec.status || 'unknown',
+      returnDeviceId: rec.returnDeviceId || null,
+      hasBilling: !!rec.billing,
+      billing: rec.billing || null,
+      createdAt: rec.createdAt || null,
+    });
+
+    if (rec.status === 'active') activeCount.active++;
+    else if (rec.status === 'completed') activeCount.completed++;
+    else if (rec.status === 'failed') activeCount.failed++;
+    else activeCount.other++;
+  }
+
+  // Also dump callback results map for debugging
+  const callbacks = [];
+  for (const [tradeNo, data] of rentalResults.entries()) {
+    callbacks.push({ tradeNo, callbackData: data });
+  }
+
+  res.json({
+    totalRecords: records.length,
+    statusBreakdown: activeCount,
+    totalCallbacks: callbacks.length,
+    records,
+    callbacks,
+    serverTime: new Date().toISOString(),
+    uptimeSeconds: Math.floor(process.uptime()),
+  });
+});
+
+// ── 10. POST /api/rent/force-complete — Admin force-complete endpoint
+// Manually triggers settlement for an order, bypassing the physical hardware webhook.
+// This allows testing the frontend redirect and billing logic independently.
+// Accepts: { orderId: "tradeNo" }
+// Executes: settleRental() → calculates duration, captures Stripe, sets status=completed
+app.post('/api/rent/force-complete', async (req, res) => {
+  const { orderId } = req.body;
+
+  console.log('[FORCE COMPLETE] Request received for orderId:', orderId);
+
+  if (!orderId) {
+    return res.status(400).json({
+      success: false,
+      error: 'orderId is required',
+    });
+  }
+
+  // ── Try to find the record in memory ──
+  let record = rentalRecords.get(orderId);
+
+  // ── If not in memory, try to find by partial match (orderId might be truncated) ──
+  if (!record) {
+    console.log('[FORCE COMPLETE] No exact match, trying partial lookup...');
+    for (const [tn, rec] of rentalRecords.entries()) {
+      if (tn.includes(orderId) || orderId.includes(tn) ||
+          (rec.batteryId && rec.batteryId === orderId) ||
+          (rec.factoryOrderId && rec.factoryOrderId === orderId)) {
+        record = rec;
+        console.log(`[FORCE COMPLETE] Found via partial match: tradeNo=${tn}`);
+        orderId = tn; // Use the actual key
+        break;
+      }
+    }
+  }
+
+  if (!record) {
+    console.warn(`[FORCE COMPLETE] No rental record found for orderId=${orderId}`);
+    return res.status(404).json({
+      success: false,
+      error: `No rental record found for orderId: ${orderId}`,
+      hint: 'Use GET /api/debug/orders to see all stored records.',
+    });
+  }
+
+  if (record.status === 'completed') {
+    console.log(`[FORCE COMPLETE] Order ${orderId} is already completed.`);
+    return res.json({
+      success: true,
+      message: 'Order was already completed',
+      orderId,
+      status: 'completed',
+      billing: record.billing,
+    });
+  }
+
+  // ── Run settlement ──
+  try {
+    console.log(`[FORCE COMPLETE] Triggering settlement for orderId=${orderId}...`);
+    console.log(`[FORCE COMPLETE] Record: deviceId=${record.deviceId}, batteryId=${record.batteryId || 'N/A'}, paymentIntentId=${record.paymentIntentId || 'NONE'}`);
+
+    const billing = await settleRental(orderId, record, record.deviceId, record.batteryId);
+
+    console.log(`[FORCE COMPLETE] Settlement complete. Charge: ${billing.chargeAmountEur} EUR`);
+
+    res.json({
+      success: true,
+      message: 'Order force-completed successfully',
+      orderId,
+      status: 'completed',
+      billing,
+      finalCost: billing.chargeAmountEur,
+      finalCostDisplay: `${billing.chargeAmountEur.toFixed(2).replace('.', ',')} €`,
+      totalDuration: billing.durationDisplay,
+    });
+  } catch (err) {
+    console.error(`[FORCE COMPLETE] Settlement failed:`, err.message);
+
+    // Even if settlement threw, force the status to completed
+    record.status = 'completed';
+    record.endTime = new Date().toISOString();
+    if (!record.billing) {
+      record.billing = { error: err.message, chargeAmountEur: 0, releasedAmountEur: 30 };
+    }
+    rentalRecords.set(orderId, record);
+
+    res.json({
+      success: true,
+      message: 'Order force-completed (settlement had errors but status is completed)',
+      orderId,
+      status: 'completed',
+      billing: record.billing,
+      error: err.message,
+    });
   }
 });
 
