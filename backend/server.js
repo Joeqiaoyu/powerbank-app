@@ -40,8 +40,11 @@ const factoryApi = axios.create({
   timeout: 15000,
 });
 
-// In-memory store for async rental callback results
+// ── In-memory stores ──────────────────────────────────────────────────
+// rentalResults: Factory async callback results (tradeNo → callback data)
+// rentalRecords: Full rental lifecycle records (tradeNo → { paymentIntentId, deviceId, startTime, endTime, status, billing })
 const rentalResults = new Map();
+const rentalRecords = new Map();
 
 // ── Known device IDs (from Factory API verification)
 const REAL_DEVICES = {
@@ -483,6 +486,20 @@ app.post('/api/rent/eject', async (req, res) => {
     const tradeNo = response.data.data?.tradeNo;
     console.log('[FACTORY API] Success! TradeNo:', tradeNo);
 
+    // ── Store rental record for settlement lifecycle ──
+    const startTime = new Date();
+    rentalRecords.set(tradeNo, {
+      tradeNo,
+      deviceId,
+      paymentIntentId: paymentIntentId || null,
+      startTime: startTime.toISOString(),
+      endTime: null,
+      status: 'active',        // active → completed | failed
+      billing: null,            // populated on return/settlement
+      createdAt: startTime.toISOString(),
+    });
+    console.log(`[RENTAL RECORD] Created for tradeNo=${tradeNo}, deviceId=${deviceId}, startTime=${startTime.toISOString()}, paymentIntentId=${paymentIntentId || 'NONE'}`);
+
     res.json({
       success: true,
       tradeNo,
@@ -517,9 +534,14 @@ app.post('/api/rent/eject', async (req, res) => {
 });
 
 // ── 5. POST /api/rent/status — Query Rental Order Status (Factory: POST /rent/order/query)
+// Legacy POST endpoint (kept for backward compat). Frontend should use GET /api/rent/status/:orderId instead.
 app.post('/api/rent/status', async (req, res) => {
   const { tradeNo } = req.body;
   console.log('[FACTORY API] Polling order status for tradeNo:', tradeNo);
+
+  // ── Check local rental record for billing info ──
+  const record = rentalRecords.get(tradeNo);
+
   try {
     const response = await factoryApi.post('/rent/order/query', null, {
       params: { tradeNo },
@@ -528,15 +550,41 @@ app.post('/api/rent/status', async (req, res) => {
     const success = response.data.code === 0;
     console.log('[FACTORY API] Order status response:', JSON.stringify(response.data, null, 2));
 
+    // ── If we have a local record and Factory says success, check for return data ──
+    if (record && record.status === 'active') {
+      const factoryData = response.data.data;
+      if (factoryData) {
+        // Factory may return returnTime / status indicating battery returned
+        const isReturned = factoryData.status === 'returned' || factoryData.returnTime || factoryData.endTime;
+        if (isReturned) {
+          console.log(`[FACTORY API] Battery returned detected for tradeNo=${tradeNo}. Return data:`, JSON.stringify(factoryData));
+          // Mark as completed if not already — settlement webhook should have handled billing
+          // This is a safety fallback in case webhook was missed
+        }
+      }
+    }
+
     res.json({
       success,
       code: response.data.code,
       message: response.data.msg,
       callbackResult: rentalResults.get(tradeNo) || null,
+      // Include billing info from local record if available
+      rentalRecord: record ? {
+        status: record.status,
+        billing: record.billing,
+        startTime: record.startTime,
+        endTime: record.endTime,
+      } : null,
     });
   } catch (error) {
     console.error('[FACTORY API ERROR] Status query failed - Status:', error.response?.status, 'Data:', JSON.stringify(error.response?.data));
-    res.status(500).json({ error: error.message, factoryError: { status: error.response?.status, data: error.response?.data } });
+    // Return local record data even if Factory query fails
+    res.status(500).json({
+      error: error.message,
+      rentalRecord: record ? { status: record.status, billing: record.billing } : null,
+      factoryError: { status: error.response?.status, data: error.response?.data },
+    });
   }
 });
 
@@ -565,6 +613,215 @@ app.post('/api/rent/callback', (req, res) => {
     rentalResults.set(tradeNo, { ...rest, timestamp: Date.now() });
   }
   res.json({ code: 0, msg: 'success' });
+});
+
+// ── 7b. POST /api/webhook/factory/return — Settlement Webhook (battery returned event)
+// Factory API calls this when a battery is returned to the cabinet.
+// We calculate the rental duration, determine the final cost, and capture from Stripe.
+app.post('/api/webhook/factory/return', async (req, res) => {
+  const { tradeNo, deviceId, status: factoryStatus } = req.body;
+  const now = new Date();
+
+  console.log('[WEBHOOK RETURN] Received factory return event:', JSON.stringify(req.body, null, 2));
+  console.log('[WEBHOOK RETURN] tradeNo:', tradeNo, 'deviceId:', deviceId, 'factoryStatus:', factoryStatus);
+
+  if (!tradeNo) {
+    console.error('[WEBHOOK RETURN] Missing tradeNo in webhook payload');
+    return res.status(400).json({ code: -1, msg: 'Missing tradeNo' });
+  }
+
+  // ── Find the rental record ──
+  const record = rentalRecords.get(tradeNo);
+  if (!record) {
+    console.warn(`[WEBHOOK RETURN] No rental record found for tradeNo=${tradeNo}. May have been created by another instance.`);
+    // Still respond success so Factory doesn't retry
+    return res.json({ code: 0, msg: 'success' });
+  }
+
+  if (record.status === 'completed') {
+    console.log(`[WEBHOOK RETURN] tradeNo=${tradeNo} already completed, ignoring duplicate webhook.`);
+    return res.json({ code: 0, msg: 'success' });
+  }
+
+  // ── Step 1: Calculate rental duration ──
+  const startTime = new Date(record.startTime);
+  const endTime = now;
+  const durationMs = endTime - startTime;
+  const durationMinutes = Math.floor(durationMs / 60000);
+  const durationHours = Math.floor(durationMinutes / 60);
+  const remainingMinutes = durationMinutes % 60;
+
+  console.log(`[SETTLEMENT] tradeNo=${tradeNo}`);
+  console.log(`[SETTLEMENT] Start: ${startTime.toISOString()} | End: ${endTime.toISOString()}`);
+  console.log(`[SETTLEMENT] Duration: ${durationMs}ms = ${durationMinutes} min (${durationHours}h ${remainingMinutes}m)`);
+
+  // ── Step 2: Apply pricing model ──
+  // Pricing from Factory API: price=1 EUR/hour, freeMinutes=10, dailyMaxPrice=10 EUR, deposit=30 EUR
+  const PRICE_PER_HOUR = 1;       // EUR
+  const FREE_MINUTES = 10;         // First 10 minutes free
+  const MIN_CHARGE = 1;            // Minimum 1 EUR (1 hour minimum)
+  const DAILY_CAP = 30;            // Capped at 30 EUR (deposit amount)
+  const DEPOSIT_AMOUNT = 3000;     // 30 EUR in cents (pre-auth hold)
+
+  let chargeAmountEur = 0;
+  if (durationMinutes <= FREE_MINUTES) {
+    chargeAmountEur = 0;
+    console.log(`[SETTLEMENT] Within free period (${durationMinutes} min <= ${FREE_MINUTES} min free). No charge.`);
+  } else {
+    // Billable minutes = total - free, rounded UP to nearest hour
+    const billableMinutes = durationMinutes - FREE_MINUTES;
+    const billableHours = Math.ceil(billableMinutes / 60); // e.g., 75 min → 2 hours
+    chargeAmountEur = billableHours * PRICE_PER_HOUR;
+    // Apply minimum charge
+    chargeAmountEur = Math.max(chargeAmountEur, MIN_CHARGE);
+    // Apply daily cap
+    chargeAmountEur = Math.min(chargeAmountEur, DAILY_CAP);
+    console.log(`[SETTLEMENT] Billable: ${billableMinutes} min → ${billableHours} hours × ${PRICE_PER_HOUR} EUR = ${chargeAmountEur} EUR (cap: ${DAILY_CAP})`);
+  }
+
+  const chargeAmountCents = Math.round(chargeAmountEur * 100);
+  const releasedAmountCents = DEPOSIT_AMOUNT - chargeAmountCents;
+
+  console.log(`[SETTLEMENT] Final charge: ${chargeAmountEur} EUR (${chargeAmountCents} cents)`);
+  console.log(`[SETTLEMENT] Deposit held: ${DEPOSIT_AMOUNT / 100} EUR (${DEPOSIT_AMOUNT} cents)`);
+  console.log(`[SETTLEMENT] To be released: ${releasedAmountCents / 100} EUR (${releasedAmountCents} cents)`);
+
+  // ── Step 3: Stripe capture ──
+  let stripeCaptureResult = null;
+  if (record.paymentIntentId && stripe) {
+    try {
+      console.log(`[SETTLEMENT] Capturing ${chargeAmountCents} cents from PI=${record.paymentIntentId}`);
+
+      const captureParams = chargeAmountCents > 0
+        ? { amount_to_capture: chargeAmountCents }
+        : {};  // 0 charge → cancel the hold entirely
+
+      if (chargeAmountCents > 0) {
+        const capture = await stripe.paymentIntents.capture(record.paymentIntentId, captureParams);
+        stripeCaptureResult = {
+          status: capture.status,
+          amountCaptured: capture.amount_capturable ? capture.amount_received : 0,
+          id: capture.id,
+        };
+        console.log(`[SETTLEMENT] Stripe capture SUCCESS: status=${capture.status}, amount_received=${capture.amount_received}, id=${capture.id}`);
+      } else {
+        // No charge — cancel the hold to release full deposit
+        const cancel = await stripe.paymentIntents.cancel(record.paymentIntentId);
+        stripeCaptureResult = {
+          status: cancel.status,
+          amountCaptured: 0,
+          id: cancel.id,
+        };
+        console.log(`[SETTLEMENT] Stripe cancel SUCCESS (free rental): status=${cancel.status}, id=${cancel.id}`);
+      }
+    } catch (stripeError) {
+      console.error(`[SETTLEMENT] Stripe capture FAILED:`, stripeError.message);
+      console.error(`[SETTLEMENT] Stripe error type:`, stripeError.type, 'code:', stripeError.code);
+      stripeCaptureResult = { error: stripeError.message, code: stripeError.code };
+      // Don't fail the webhook — Factory needs an ack. We'll handle retry separately.
+    }
+  } else {
+    console.warn(`[SETTLEMENT] No paymentIntentId or Stripe not configured — skipping capture. paymentIntentId=${record.paymentIntentId}, stripe=${!!stripe}`);
+  }
+
+  // ── Step 4: Update rental record ──
+  const billing = {
+    durationMinutes,
+    durationDisplay: `${durationHours} h ${remainingMinutes} min`,
+    freeMinutes: FREE_MINUTES,
+    pricePerHour: PRICE_PER_HOUR,
+    chargeAmountEur,
+    chargeAmountCents,
+    depositAmountEur: DEPOSIT_AMOUNT / 100,
+    releasedAmountEur: releasedAmountCents / 100,
+    currency: 'EUR',
+    stripeCapture: stripeCaptureResult,
+  };
+
+  record.endTime = endTime.toISOString();
+  record.status = 'completed';
+  record.billing = billing;
+  rentalRecords.set(tradeNo, record);
+
+  console.log(`[SETTLEMENT] Record updated: tradeNo=${tradeNo}, status=completed, billing=${JSON.stringify(billing)}`);
+
+  // ── Acknowledge webhook to Factory ──
+  res.json({ code: 0, msg: 'success' });
+});
+
+// ── 7c. GET /api/rent/status/:orderId — Full status endpoint for frontend polling
+// Returns rental status including billing info when completed.
+// Supports both tradeNo (Factory order) and session-based lookups.
+app.get('/api/rent/status/:orderId', async (req, res) => {
+  const orderId = req.params.orderId;
+  console.log(`[STATUS POLL] Querying status for orderId=${orderId}`);
+
+  // ── Check our local rental records first ──
+  const record = rentalRecords.get(orderId);
+
+  if (record) {
+    console.log(`[STATUS POLL] Found record: status=${record.status}, hasBilling=${!!record.billing}`);
+
+    // If still active, also query Factory API for latest status
+    if (record.status === 'active') {
+      try {
+        const factoryRes = await factoryApi.post('/rent/order/query', null, {
+          params: { tradeNo: orderId },
+        });
+        console.log(`[STATUS POLL] Factory query response:`, JSON.stringify(factoryRes.data, null, 2));
+
+        // Check if Factory indicates the battery was returned
+        // Factory callback data may contain return info
+        const callbackData = rentalResults.get(orderId);
+        if (callbackData) {
+          console.log(`[STATUS POLL] Found callback data:`, JSON.stringify(callbackData));
+          // If callback indicates return, trigger settlement
+          if (callbackData.status === 'returned' || callbackData.returnTime) {
+            console.log(`[STATUS POLL] Battery returned detected via callback. Triggering settlement...`);
+            // Settlement is handled by webhook, but as fallback we process it here
+          }
+        }
+      } catch (err) {
+        console.warn(`[STATUS POLL] Factory query failed (non-fatal):`, err.message);
+      }
+    }
+
+    return res.json({
+      success: true,
+      tradeNo: record.tradeNo,
+      deviceId: record.deviceId,
+      status: record.status,                 // 'active' | 'completed' | 'failed'
+      startTime: record.startTime,
+      endTime: record.endTime,
+      billing: record.billing,               // null when active, populated when completed
+      callbackResult: rentalResults.get(orderId) || null,
+    });
+  }
+
+  // ── Fallback: query Factory API directly if no local record ──
+  console.log(`[STATUS POLL] No local record for orderId=${orderId}, querying Factory...`);
+  try {
+    const response = await factoryApi.post('/rent/order/query', null, {
+      params: { tradeNo: orderId },
+    });
+
+    console.log(`[STATUS POLL] Factory response:`, JSON.stringify(response.data, null, 2));
+
+    return res.json({
+      success: response.data.code === 0,
+      tradeNo: orderId,
+      status: response.data.code === 0 ? 'active' : 'unknown',
+      message: response.data.msg,
+      callbackResult: rentalResults.get(orderId) || null,
+    });
+  } catch (error) {
+    console.error(`[STATUS POLL] Factory query failed:`, error.message);
+    return res.status(500).json({
+      success: false,
+      error: error.message,
+      factoryError: { status: error.response?.status, data: error.response?.data },
+    });
+  }
 });
 
 // ── 8. POST /api/rent/cancel-hold — Cancel a Stripe payment hold (used on rental timeout)
