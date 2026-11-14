@@ -71,7 +71,7 @@ export default function ScannerModal({ onScan, onClose }) {
             value={manualId}
             onChange={(e) => setManualId(e.target.value)}
             onKeyDown={(e) => { if (e.key === 'Enter') submitManual(); }}
-            placeholder="N° de la machine (ex. DTA55642)"
+            placeholder="N° de la machine (ex. DTA55642, DTA55645...)"
             style={{
               flex: 1, padding: '12px', borderRadius: '8px',
               border: '1px solid #D1D5DB', fontSize: '15px', color: 'black',

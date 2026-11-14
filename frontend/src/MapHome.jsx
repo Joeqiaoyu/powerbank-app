@@ -73,6 +73,9 @@ export default function MapHome() {
     markersRef.current.forEach(marker => marker.remove());
     markersRef.current = [];
 
+    // ── Collect valid coordinates for auto-fit bounds ──
+    const validCoords = [];
+
     cabinets.forEach(cab => {
       let isAvailable = false;
       let color = '#EF4444'; 
@@ -113,8 +116,28 @@ export default function MapHome() {
         .setPopup(new mapboxgl.Popup().setHTML(popupHTML))
         .addTo(map.current);
         
-      markersRef.current.push(marker); 
+      markersRef.current.push(marker);
+
+      // Collect valid coordinates for bounds fitting
+      if (cab.lat && cab.lng && !isNaN(cab.lat) && !isNaN(cab.lng)) {
+        validCoords.push([cab.lng, cab.lat]);
+      }
     });
+
+    // ── Auto-fit map bounds to show all fleet stations ──
+    if (validCoords.length > 0) {
+      if (validCoords.length === 1) {
+        // Single station — center on it
+        map.current.flyTo({ center: validCoords[0], zoom: 15 });
+      } else {
+        // Multiple stations — fit bounds to include all
+        const bounds = validCoords.reduce(
+          (b, coord) => b.extend(coord),
+          new mapboxgl.LngLatBounds(validCoords[0], validCoords[0])
+        );
+        map.current.fitBounds(bounds, { padding: 80, maxZoom: 16 });
+      }
+    }
   }, [cabinets, mode]);
 
   return (
