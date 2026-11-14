@@ -820,28 +820,43 @@ async function settleRental(orderId, record, returnDeviceId, batteryId) {
 // This endpoint handles ALL possible Factory payload formats (JSON, form-urlencoded, etc.)
 // and ALL possible field names (tradeNo, order_id, battery_id, device_id, sn, etc.)
 app.post('/api/webhook/factory/return', async (req, res) => {
-  // ── DEEP CATCH-ALL LOGGING at the very top ──
-  // IoT factories often send x-www-form-urlencoded instead of JSON.
-  // We log everything to diagnose format mismatches.
+  // ── BULLETPROOF LOGGING: Log EVERYTHING at the very first line ──
+  // This must execute before ANY other logic so we never lose webhook data
+  // even if the handler crashes downstream.
   console.log('═══════════════════════════════════════════════════════════════');
+  console.log('[WEBHOOK RECEIVED] Timestamp:', new Date().toISOString());
+  console.log('[WEBHOOK RECEIVED] Method:', req.method, 'URL:', req.originalUrl);
+  console.log('[WEBHOOK RECEIVED] Query params:', JSON.stringify(req.query, null, 2));
   console.log('[WEBHOOK RECEIVED] Headers:', JSON.stringify(req.headers, null, 2));
   console.log('[WEBHOOK RECEIVED] Body (raw):', JSON.stringify(req.body, null, 2));
   console.log('[WEBHOOK RECEIVED] Content-Type:', req.headers['content-type']);
   console.log('[WEBHOOK RECEIVED] Body type:', typeof req.body);
   console.log('[WEBHOOK RECEIVED] Body keys:', req.body ? Object.keys(req.body) : 'NO BODY');
+  // If body is a string or empty, log it as-is for debugging form-urlencoded issues
+  if (typeof req.body === 'string') {
+    console.log('[WEBHOOK RECEIVED] Body is STRING (not parsed):', req.body);
+  }
+  if (!req.body || (typeof req.body === 'object' && Object.keys(req.body).length === 0)) {
+    console.warn('[WEBHOOK RECEIVED] ⚠️ Body is EMPTY or UNPARSED. Checking raw body and query...');
+    console.log('[WEBHOOK RECEIVED] req.query (fallback):', JSON.stringify(req.query));
+  }
   console.log('═══════════════════════════════════════════════════════════════');
 
   const body = req.body || {};
+  const query = req.query || {};
+  // Merge query params into body — some Factory APIs send data as query params instead of body
+  const mergedData = { ...query, ...body };
   const now = new Date();
 
-  // ── Extract ALL possible identifier fields from the Factory payload ──
+  // ── Extract ALL possible identifier fields from merged (body + query) Factory payload ──
   // Different Factory API versions and event types use different field names.
-  const tradeNo      = body.tradeNo || body.trade_no || body.tradeNo;
-  const orderId      = tradeNo || body.order_id || body.orderId || body.orderNo || body.order_no || body.sn;
-  const batteryId    = body.batteryId || body.battery_id || body.batterySn || body.battery_sn || body.powerBankId || body.power_bank_id;
-  const deviceId     = body.deviceId || body.device_id || body.cabinetId || body.cabinet_id || body.machineId || body.machine_id;
-  const returnDeviceId = body.returnDeviceId || body.return_device_id || body.returnCabinetId || body.return_cabinet_id || deviceId;
-  const factoryStatus = body.status || body.type || body.event || body.action || body.eventType;
+  // We also check query params since some Factory callbacks send data as URL query params.
+  const tradeNo      = mergedData.tradeNo || mergedData.trade_no;
+  const orderId      = tradeNo || mergedData.order_id || mergedData.orderId || mergedData.orderNo || mergedData.order_no || mergedData.sn;
+  const batteryId    = mergedData.batteryId || mergedData.battery_id || mergedData.batterySn || mergedData.battery_sn || mergedData.powerBankId || mergedData.power_bank_id;
+  const deviceId     = mergedData.deviceId || mergedData.device_id || mergedData.cabinetId || mergedData.cabinet_id || mergedData.machineId || mergedData.machine_id;
+  const returnDeviceId = mergedData.returnDeviceId || mergedData.return_device_id || mergedData.returnCabinetId || mergedData.return_cabinet_id || deviceId;
+  const factoryStatus = mergedData.status || mergedData.type || mergedData.event || mergedData.action || mergedData.eventType;
 
   console.log(`[WEBHOOK RETURN] Parsed identifiers:`);
   console.log(`  orderId/tradeNo:  ${orderId || 'NOT FOUND'}`);

@@ -30,6 +30,7 @@ export default function ActiveRental() {
   const [finalCost, setFinalCost] = useState(null);
   const [errorMessage, setErrorMessage] = useState('');
   const [pollCount, setPollCount] = useState(0);
+  const [manualChecking, setManualChecking] = useState(false); // manual refresh button state
 
   const tickRef = useRef(null);
   const pollRef = useRef(null);
@@ -97,6 +98,43 @@ export default function ActiveRental() {
       setRentalStatus('error');
     }
   }, [orderId, navigate]);
+
+  // ── Manual fallback: "J'ai retourné la batterie" button handler ──
+  // When the user physically returns the battery but the automatic polling
+  // hasn't detected it yet (Factory API delay, Render cold start, etc.),
+  // the user can manually trigger a status check.
+  const handleManualReturnCheck = useCallback(async () => {
+    if (manualChecking || rentalStatus !== 'active') return;
+    setManualChecking(true);
+    console.log('[MANUAL CHECK] User triggered manual return check for orderId:', orderId);
+
+    try {
+      const { data } = await api.get(`/api/rent/status/${orderId}`);
+      console.log("[MANUAL CHECK RESPONSE]", {
+        status: data.status,
+        finalCost: data.finalCost,
+        totalDuration: data.totalDuration,
+        hasBilling: !!data.billing,
+      });
+
+      if (data.status === 'completed') {
+        // Battery return confirmed — stop everything and redirect
+        if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+        if (tickRef.current) { clearInterval(tickRef.current); tickRef.current = null; }
+        setFinalCost(data.finalCost);
+        setRentalStatus('completed');
+        setTimeout(() => navigate(`/rent/summary?orderId=${orderId}`), 1200);
+      } else {
+        // Still active — show alert that the machine hasn't confirmed yet
+        alert("En attente de la confirmation de la machine...\n\nLa batterie n'a pas encore été détectée comme retournée. Le système vérifie automatiquement toutes les 3 secondes. Veuillez patienter quelques instants.");
+      }
+    } catch (err) {
+      console.warn('[MANUAL CHECK] Error:', err.message);
+      alert("Impossible de vérifier le statut pour le moment.\n\nLe serveur peut être en cours de démarrage. Le système continue à vérifier automatiquement.");
+    } finally {
+      setManualChecking(false);
+    }
+  }, [manualChecking, rentalStatus, orderId, navigate]);
 
   useEffect(() => {
     fetchStatus();
@@ -361,6 +399,29 @@ export default function ActiveRental() {
           </ul>
         </div>
 
+        {/* ── Manual return button (fallback) ── */}
+        {/* User clicks this after physically returning the battery.
+            It triggers an immediate status check instead of waiting for the 3s poll. */}
+        <button
+          onClick={handleManualReturnCheck}
+          disabled={manualChecking}
+          className="w-full bg-green-500 text-white py-4 rounded-xl font-bold text-base hover:bg-green-600 transition shadow-lg mb-4 disabled:opacity-60 disabled:cursor-not-allowed"
+        >
+          {manualChecking ? (
+            <span className="flex items-center justify-center gap-2">
+              <span className="inline-block w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+              Vérification en cours...
+            </span>
+          ) : (
+            <span className="flex items-center justify-center gap-2">
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+              </svg>
+              J'ai retourné la batterie (Rafraîchir)
+            </span>
+          )}
+        </button>
+
         {/* ── Order ID ── */}
         <p className="text-gray-400 text-xs text-center mb-4">
           Commande: <span className="font-mono">{orderId}</span>
@@ -368,7 +429,7 @@ export default function ActiveRental() {
 
         {/* ── Polling indicator (subtle) ── */}
         <p className="text-gray-300 text-xs text-center mb-4">
-          Verification automatique toutes les 5 secondes...
+          Vérification automatique toutes les 3 secondes...
         </p>
 
         {/* ── Return to map button ── */}
