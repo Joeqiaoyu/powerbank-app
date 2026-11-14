@@ -1164,6 +1164,8 @@ app.get('/api/rent/status/:orderId', async (req, res) => {
   }
 
   // ── Fallback: query Factory API directly if no local record ──
+  // This happens when Render restarts (free tier sleep) and loses in-memory data.
+  // We reconstruct a minimal record from Factory's response and check for return.
   console.log(`[STATUS POLL] No local record for orderId=${orderId}, querying Factory...`);
   try {
     const response = await factoryApi.post('/rent/order/query', null, {
@@ -1172,18 +1174,135 @@ app.get('/api/rent/status/:orderId', async (req, res) => {
 
     console.log(`[STATUS POLL] Factory fallback response:`, JSON.stringify(response.data, null, 2));
 
-    // ── Even without a local record, try to determine status from Factory response ──
     const factoryData = response.data?.data;
-    const factoryStatus = String(factoryData?.status ?? '').trim();
-    const isActive = factoryStatus === '1' || response.data.code === 0;
+    const factoryCode = response.data?.code;
+    const callbackData = rentalResults.get(orderId);
 
+    // ── Determine Factory order status ──
+    const factoryStatus = String(factoryData?.status ?? factoryData?.orderStatus ?? factoryData?.state ?? '').trim();
+    const callbackStatus = String(callbackData?.status ?? '').trim();
+
+    // Status "1" = active/rented. Empty or other = unknown/returned
+    const isActive = factoryStatus === '1' || (factoryStatus === '' && factoryCode === 0 && !callbackStatus);
+
+    // ── Check if Factory indicates the battery was returned ──
+    // (same logic as above, but for records that only exist in Factory, not locally)
+    let factorySaysReturned = false;
+    let returnReason = '';
+
+    // Check callback status: if it changed from "1" to something else
+    if (callbackStatus && callbackStatus !== '1' && callbackStatus !== '') {
+      factorySaysReturned = true;
+      returnReason = `Callback status="${callbackStatus}" (not "1"=active)`;
+    }
+
+    // Check Factory data status
+    if (!factorySaysReturned && factoryStatus && factoryStatus !== '1' && factoryStatus !== '') {
+      const returnKeywords = ['return', 'returned', 'end', 'ended', 'finish', 'finished', 'complete', 'completed', 'close', 'closed'];
+      if (returnKeywords.some(kw => factoryStatus.toLowerCase().includes(kw))) {
+        factorySaysReturned = true;
+        returnReason = `Factory status="${factoryStatus}" (return keyword)`;
+      } else {
+        // Non-"1" numeric status = likely returned
+        factorySaysReturned = true;
+        returnReason = `Factory status="${factoryStatus}" (not "1"=active)`;
+      }
+    }
+
+    // Check return time fields
+    if (!factorySaysReturned && factoryData) {
+      const hasReturnTime = factoryData.returnTime || factoryData.endTime || factoryData.return_time || factoryData.end_time || factoryData.closeTime;
+      if (hasReturnTime) {
+        factorySaysReturned = true;
+        returnReason = `Factory has returnTime/endTime`;
+      }
+    }
+
+    // Check Factory error codes
+    if (!factorySaysReturned && factoryCode !== undefined && factoryCode !== 0) {
+      if (factoryCode === 2004 || factoryCode === 2005 || factoryCode === 2006) {
+        factorySaysReturned = true;
+        returnReason = `Factory code=${factoryCode} (order closed/not found)`;
+      }
+    }
+
+    // ── If returned and we have Factory data, reconstruct a record and settle ──
+    if (factorySaysReturned) {
+      console.log(`[STATUS POLL] *** RETURN DETECTED in fallback! Reason: ${returnReason}. Reconstructing record and settling... ***`);
+
+      // Reconstruct a minimal record from Factory data
+      // We may not have the original startTime, so use callback timestamp as approximation
+      const callbackTime = callbackData?.timestamp ? new Date(callbackData.timestamp).toISOString() : new Date().toISOString();
+      const startTime = factoryData?.createTime || factoryData?.create_time || factoryData?.rentTime || factoryData?.rent_time || callbackTime;
+      const reconstructedRecord = {
+        tradeNo: orderId,
+        deviceId: factoryData?.deviceId || factoryData?.device_id || factoryData?.cabinetId || 'UNKNOWN',
+        batteryId: factoryData?.batteryId || factoryData?.battery_id || factoryData?.batterySn || null,
+        paymentIntentId: null, // We don't have this — Stripe capture will be skipped
+        startTime,
+        endTime: null,
+        status: 'active',
+        billing: null,
+        createdAt: startTime,
+      };
+
+      console.log(`[STATUS POLL] Reconstructed record: startTime=${startTime}, deviceId=${reconstructedRecord.deviceId}`);
+
+      // Store it so settleRental can find and update it
+      rentalRecords.set(orderId, reconstructedRecord);
+
+      try {
+        const returnDeviceId = factoryData?.returnDeviceId || factoryData?.return_device_id || factoryData?.cabinetId || reconstructedRecord.deviceId;
+        const batteryId = factoryData?.batteryId || factoryData?.battery_id || null;
+        await settleRental(orderId, reconstructedRecord, returnDeviceId, batteryId);
+        console.log(`[STATUS POLL] Fallback settlement complete. Status: ${reconstructedRecord.status}`);
+
+        // Return the completed record
+        const billing = reconstructedRecord.billing;
+        const startTimeMs = new Date(reconstructedRecord.startTime).getTime();
+        const endTimeMs = reconstructedRecord.endTime ? new Date(reconstructedRecord.endTime).getTime() : Date.now();
+        const totalDurationSeconds = Math.floor((endTimeMs - startTimeMs) / 1000);
+
+        return res.json({
+          success: true,
+          orderId,
+          tradeNo: orderId,
+          deviceId: reconstructedRecord.deviceId,
+          status: 'completed',
+          startTime: reconstructedRecord.startTime,
+          endTime: reconstructedRecord.endTime,
+          totalDuration: billing?.durationDisplay || `${Math.floor(totalDurationSeconds / 3600)} h ${Math.floor((totalDurationSeconds % 3600) / 60)} min`,
+          totalDurationSeconds,
+          finalCost: billing?.chargeAmountEur || 0,
+          finalCostDisplay: `${(billing?.chargeAmountEur || 0).toFixed(2).replace('.', ',')} \u20ac`,
+          billing,
+          depositReleased: billing?.releasedAmountEur || 0,
+          callbackResult: callbackData,
+          note: 'Record reconstructed from Factory API after server restart',
+        });
+      } catch (settleErr) {
+        console.error(`[STATUS POLL] Fallback settlement failed:`, settleErr.message);
+        // Still return completed so timer stops
+        return res.json({
+          success: true,
+          orderId,
+          status: 'completed',
+          finalCost: 0,
+          finalCostDisplay: '0,00 \u20ac',
+          billing: { error: settleErr.message, chargeAmountEur: 0, releasedAmountEur: 30 },
+          note: 'Settlement failed but marked completed to stop timer',
+        });
+      }
+    }
+
+    // ── If still active, return active status ──
     return res.json({
       success: response.data.code === 0,
       tradeNo: orderId,
       status: isActive ? 'active' : 'unknown',
-      message: response.data.msg,
       factoryStatus,
-      callbackResult: rentalResults.get(orderId) || null,
+      message: response.data.msg,
+      callbackResult: callbackData,
     });
   } catch (error) {
     console.error(`[STATUS POLL] Factory query failed:`, error.message);
